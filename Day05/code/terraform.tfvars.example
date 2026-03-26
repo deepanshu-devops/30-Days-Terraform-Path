@@ -1,0 +1,13 @@
+# Day 05 — Example Variable Values
+
+aws_region         = "us-east-1"
+project            = "myapp"
+environment        = "dev"
+vpc_cidr           = "10.0.0.0/16"
+enable_nat_gateway = false
+subnet_count       = 2
+
+tags = {
+  Team       = "platform"
+  CostCenter = "engineering"
+}
