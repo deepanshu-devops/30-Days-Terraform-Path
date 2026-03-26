@@ -1,0 +1,7 @@
+# Day 01 — Example Variable Values
+# Copy this file and customize for your environment
+# DO NOT commit files with sensitive values to Git
+
+aws_region  = "us-east-1"
+environment = "learning"
+vpc_cidr    = "10.0.0.0/16"
