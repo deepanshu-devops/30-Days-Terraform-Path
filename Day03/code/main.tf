@@ -1,48 +1,28 @@
 ################################################################################
-# Day 03 — Providers, Resources & State
-# Demonstrates: Multi-provider, resource meta-arguments, state concepts
+# Day 03 — main.tf
+# Topic: Providers, Resources & State
+#
+# Real-life scenario:
+#   You are a DevOps engineer at a startup. The product team asks you to
+#   provision a basic network in both the US and EU for GDPR compliance.
+#   Instead of clicking in two console sessions, you write this once.
 ################################################################################
 
-terraform {
-  required_version = ">= 1.6.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.0"
-    }
-  }
+locals {
+  name_prefix = "${var.project}-${var.environment}"
 }
 
-# Default AWS provider (us-east-1)
-provider "aws" {
-  region = "us-east-1"
-  default_tags {
-    tags = { ManagedBy = "Terraform", Day = "Day03" }
-  }
-}
+# ── Data Sources (read-only queries — no resources created) ──────────────────
 
-# Aliased provider for a second region
-provider "aws" {
-  alias  = "eu_west"
-  region = "eu-west-1"
-  default_tags {
-    tags = { ManagedBy = "Terraform", Day = "Day03" }
-  }
-}
-
-# ---------------------------------------------------------------------------
-# Data Sources — read existing data without creating resources
-# ---------------------------------------------------------------------------
+# Which AZs are available in our region?
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
+# Who is running this? Useful for building ARNs dynamically
 data "aws_caller_identity" "current" {}
 
+# Always get the latest Amazon Linux 2023 AMI — never hardcode AMI IDs
 data "aws_ami" "amazon_linux" {
   most_recent = true
   owners      = ["amazon"]
@@ -52,33 +32,43 @@ data "aws_ami" "amazon_linux" {
   }
 }
 
-# ---------------------------------------------------------------------------
-# Resources in us-east-1 (default provider)
-# ---------------------------------------------------------------------------
+# ── Random suffix so bucket names are globally unique ────────────────────────
 resource "random_pet" "suffix" {
   length = 2
 }
 
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
+# ── US VPC (default provider = us-east-1) ───────────────────────────────────
+# Real-life: Your US production network. Every other resource (EKS, RDS)
+#            will live inside this VPC.
+resource "aws_vpc" "us" {
+  cidr_block           = var.vpc_cidr
   enable_dns_support   = true
-  enable_dns_hostnames = true
+  enable_dns_hostnames = true # Required if you use private Route53 zones
 
-  tags = { Name = "day03-vpc-${random_pet.suffix.id}" }
+  tags = {
+    Name = "${local.name_prefix}-us-vpc"
+    Tier = "networking"
+  }
 }
 
+# Public subnet — web servers and load balancers go here
 resource "aws_subnet" "public" {
-  vpc_id            = aws_vpc.main.id  # Implicit dependency
+  vpc_id            = aws_vpc.us.id            # Implicit dep: created after VPC
   cidr_block        = "10.0.1.0/24"
   availability_zone = data.aws_availability_zones.available.names[0]
 
-  tags = { Name = "day03-public-subnet", Tier = "public" }
+  tags = {
+    Name = "${local.name_prefix}-public-subnet"
+    Tier = "public"
+  }
 }
 
+# Security group — only HTTPS in, all out
+# Real-life: The firewall rules for your web tier
 resource "aws_security_group" "web" {
-  name        = "day03-web-sg"
-  description = "Security group for web tier"
-  vpc_id      = aws_vpc.main.id
+  name        = "${local.name_prefix}-web-sg"
+  description = "Allow HTTPS inbound, all outbound"
+  vpc_id      = aws_vpc.us.id
 
   ingress {
     from_port   = 443
@@ -93,69 +83,42 @@ resource "aws_security_group" "web" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-    description = "All outbound traffic"
+    description = "All outbound"
   }
 
   lifecycle {
+    # Create the new SG before destroying the old one
+    # Prevents downtime during security group updates
     create_before_destroy = true
   }
 
-  tags = { Name = "day03-web-sg" }
+  tags = { Name = "${local.name_prefix}-web-sg" }
 }
 
-# Resource with lifecycle rules
+# S3 bucket for application logs
 resource "aws_s3_bucket" "logs" {
-  bucket        = "day03-logs-${random_pet.suffix.id}"
-  force_destroy = true
+  bucket        = "${local.name_prefix}-logs-${random_pet.suffix.id}"
+  force_destroy = true # OK for learning; remove in prod
 
   lifecycle {
-    # Uncomment in production to prevent accidental deletion:
-    # prevent_destroy = true
-    ignore_changes = [
-      tags["CreatedDate"] # Don't track this tag change in plan
-    ]
+    # If someone adds a tag manually in console, Terraform won't fight them
+    ignore_changes = [tags["LastModifiedByHuman"]]
   }
+
+  tags = { Name = "${local.name_prefix}-logs" }
+}
+
+# ── EU VPC (aliased provider = eu-west-1) ───────────────────────────────────
+# Real-life: GDPR requires EU customer data stays in EU.
+#            Same pattern, different region, different CIDR.
+resource "aws_vpc" "eu" {
+  provider             = aws.eu_west         # Override to eu-west-1
+  cidr_block           = var.eu_vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
 
   tags = {
-    Name        = "day03-logs"
-    CreatedDate = "2024-01-01" # Will be ignored by lifecycle rule above
+    Name       = "${local.name_prefix}-eu-vpc"
+    Compliance = "GDPR"
   }
-}
-
-# ---------------------------------------------------------------------------
-# Resource in eu-west-1 (aliased provider)
-# ---------------------------------------------------------------------------
-resource "aws_vpc" "eu" {
-  provider   = aws.eu_west
-  cidr_block = "10.1.0.0/16"
-
-  tags = { Name = "day03-vpc-eu-${random_pet.suffix.id}" }
-}
-
-# ---------------------------------------------------------------------------
-# Outputs
-# ---------------------------------------------------------------------------
-output "us_vpc_id" {
-  description = "VPC ID in us-east-1"
-  value       = aws_vpc.main.id
-}
-
-output "eu_vpc_id" {
-  description = "VPC ID in eu-west-1"
-  value       = aws_vpc.eu.id
-}
-
-output "aws_account_id" {
-  description = "Current AWS account"
-  value       = data.aws_caller_identity.current.account_id
-}
-
-output "latest_amazon_linux_ami" {
-  description = "Latest Amazon Linux 2023 AMI"
-  value       = data.aws_ami.amazon_linux.id
-}
-
-output "subnet_id" {
-  description = "Public subnet ID"
-  value       = aws_subnet.public.id
 }
