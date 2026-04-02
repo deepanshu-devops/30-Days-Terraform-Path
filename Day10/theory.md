@@ -1,152 +1,164 @@
-# Day 10 — Writing Your First Reusable Terraform Module
+# Day 10 — Writing Reusable Terraform Modules
 
-## WHAT
-A Terraform module is a collection of `.tf` files in a directory. Every Terraform configuration is technically a module — the "root module". A reusable module is one explicitly designed for use by other configurations.
+## Real-Life Example 🏗️
 
-## Module Structure
+**The Copy-Paste Problem:**  
+You build a VPC for Team A. Team B asks for a VPC. You copy-paste the code, change a few names. Team C, D, E — same thing.
+
+Six months later: security finds a missing flow log configuration. You need to add it to all six VPC codebases. You'll update five and forget one. That sixth VPC is now non-compliant.
+
+**The Module Solution:**  
+Fix the VPC module once → all six teams get the fix on their next `terraform apply`.
+
+At Amdocs, this single change — from copy-paste to modules — reduced provisioning time from 48 hours to 30 minutes.
+
+---
+
+## What is a Module?
+
+A module is just **a folder of `.tf` files** designed to be called by other configurations.
+
+Every Terraform configuration is technically a module (the "root module"). A _reusable_ module is one explicitly structured for calling from multiple places.
 
 ```
 modules/
   vpc/
-    main.tf       # Core resources
-    variables.tf  # Input variables (the module's API)
-    outputs.tf    # Outputs exposed to callers
-    versions.tf   # Required Terraform/provider versions
-    README.md     # Documentation
+    variables.tf   ← module inputs (the public API)
+    main.tf        ← resources (the implementation)
+    outputs.tf     ← module outputs (what callers receive)
+    # NO provider.tf — modules never define providers
+    # NO backend    — modules never define state
 ```
-
-## Module Design Principles
-
-### 1. Single Responsibility
-Each module does one thing well. A VPC module creates VPCs and subnets — not EKS clusters.
-
-### 2. Opinionated Defaults
-Provide sensible defaults. Callers should not have to specify obvious things.
-
-### 3. Documented Inputs/Outputs
-Every variable and output must have a `description`.
-
-### 4. No Backend Configuration
-Modules never define a backend. Only root modules do.
-
-### 5. Version Constraints
-Pin provider versions in `versions.tf` to protect module consumers.
 
 ---
 
-## Example: VPC Module
+## The Three Module Files
 
-### modules/vpc/versions.tf
-```hcl
-terraform {
-  required_version = ">= 1.4.0"
-  required_providers {
-    aws = { source = "hashicorp/aws", version = ">= 5.0" }
-  }
-}
-```
+### `variables.tf` — The Module's Input API
 
-### modules/vpc/variables.tf
 ```hcl
+# Everything a caller must or can provide
 variable "name" {
-  description = "Name prefix for all resources"
+  description = "Name prefix for all resources created by this module"
   type        = string
 }
 
-variable "cidr_block" {
+variable "vpc_cidr" {
   description = "CIDR block for the VPC"
   type        = string
   default     = "10.0.0.0/16"
   validation {
-    condition     = can(cidrhost(var.cidr_block, 0))
+    condition     = can(cidrhost(var.vpc_cidr, 0))
     error_message = "Must be a valid CIDR block."
   }
 }
 
-variable "availability_zones" {
-  description = "List of AZs to deploy subnets into"
-  type        = list(string)
-}
-
-variable "public_subnet_cidrs" {
-  description = "CIDR blocks for public subnets (one per AZ)"
-  type        = list(string)
-  default     = []
-}
-
-variable "private_subnet_cidrs" {
-  description = "CIDR blocks for private subnets (one per AZ)"
-  type        = list(string)
-  default     = []
-}
-
 variable "enable_nat_gateway" {
-  description = "Create NAT Gateway for private subnet internet access"
-  type        = bool
-  default     = true
-}
-
-variable "single_nat_gateway" {
-  description = "Use a single NAT Gateway (cost saving for dev)"
+  description = "Create a NAT Gateway. Costs ~$32/month. Set false for dev."
   type        = bool
   default     = false
 }
+```
 
-variable "tags" {
-  description = "Additional tags to apply to all resources"
-  type        = map(string)
-  default     = {}
+### `main.tf` — The Implementation
+
+```hcl
+# No provider block. No backend block.
+# Resources use var.x for inputs, output to outputs.tf
+
+locals {
+  common_tags = { ManagedBy = "Terraform", Module = "vpc" }
+}
+
+resource "aws_vpc" "this" {          # "this" is the convention for single-instance module resources
+  cidr_block = var.vpc_cidr
+  tags       = merge(local.common_tags, { Name = "${var.name}-vpc" })
 }
 ```
 
-### modules/vpc/outputs.tf
+### `outputs.tf` — What the Module Returns
+
 ```hcl
-output "vpc_id"              { value = aws_vpc.this.id }
-output "vpc_arn"             { value = aws_vpc.this.arn }
-output "vpc_cidr_block"      { value = aws_vpc.this.cidr_block }
-output "public_subnet_ids"   { value = aws_subnet.public[*].id }
-output "private_subnet_ids"  { value = aws_subnet.private[*].id }
-output "nat_gateway_ids"     { value = aws_nat_gateway.this[*].id }
-output "internet_gateway_id" { value = aws_internet_gateway.this.id }
-```
-
-### Calling the Module
-```hcl
-module "vpc" {
-  source = "./modules/vpc"  # Local path
-  # OR: source = "git::https://github.com/org/terraform-modules.git//vpc?ref=v1.2.0"
-
-  name               = "myapp-prod"
-  cidr_block         = "10.0.0.0/16"
-  availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
-  public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  private_subnet_cidrs = ["10.0.11.0/24", "10.0.12.0/24", "10.0.13.0/24"]
-  enable_nat_gateway   = true
-  single_nat_gateway   = false  # One per AZ for HA in production
-
-  tags = {
-    Environment = "production"
-    Team        = "platform"
-  }
+output "vpc_id" {
+  description = "VPC ID — pass to EKS, RDS, ALB modules"
+  value       = aws_vpc.this.id
 }
-
-# Access module outputs
-output "vpc_id"            { value = module.vpc.vpc_id }
-output "private_subnet_ids" { value = module.vpc.private_subnet_ids }
+output "private_subnet_ids" {
+  description = "Private subnet IDs for EKS node groups and RDS"
+  value       = aws_subnet.private[*].id
+}
 ```
 
 ---
 
-## Audience Levels
+## Calling a Module
 
-### 🟢 Beginner
-A module is like a function. You call it with inputs (variables), it creates resources, and returns outputs. Instead of copy-pasting the same VPC code in every project, you write it once as a module and call it everywhere.
+```hcl
+# Local path (development — no version pinning)
+module "vpc" {
+  source = "./modules/vpc"
+  name   = "myapp-prod"
+  vpc_cidr = "10.0.0.0/16"
+}
 
-### 🔵 Intermediate
-Build modules for your most common patterns: VPC, EKS, RDS, ALB, IAM roles. Track them in a separate Git repo (`terraform-modules`). Tag versions. Onboard new projects by calling the modules.
+# Git tag (production — ALWAYS use a version tag)
+module "vpc" {
+  source = "git::https://github.com/org/terraform-modules.git//vpc?ref=v1.2.0"
+  name   = "myapp-prod"
+}
 
-### 🟠 Advanced
-Module composition: modules can call other modules. An "app module" can call VPC + EKS + RDS modules. Keep nesting shallow (2 levels max) to avoid dependency complexity.
+# Terraform Registry (community modules)
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.5.3"    # exact version — never omit this
+  name    = "myapp-prod"
+}
 
-### 🔴 Expert
-Module testing with Terratest (Day 20). Contract testing: validate that module outputs exist and have expected types before releasing a new version. Use `terraform-docs` to auto-generate README from variable/output blocks.
+# After adding ANY module call: run terraform init
+terraform init    # downloads the module
+```
+
+---
+
+## Accessing Module Outputs
+
+```hcl
+# In main.tf of the calling (root) module:
+module "vpc" {
+  source = "./modules/vpc"
+  name   = "myapp"
+}
+
+# Access module outputs with: module.<name>.<output_name>
+resource "aws_eks_cluster" "main" {
+  vpc_config {
+    subnet_ids = module.vpc.private_subnet_ids    # ← module output
+    vpc_id     = module.vpc.vpc_id                # ← module output
+  }
+}
+```
+
+---
+
+## Module Design Principles
+
+| Principle | Example |
+|-----------|---------|
+| **Single responsibility** | VPC module creates only VPC resources — not EKS |
+| **Sensible defaults** | `enable_nat_gateway = false` saves money in dev |
+| **No hardcoded values** | Everything comes from `var.x` |
+| **Documented API** | Every variable and output has a `description` |
+| **Named "this" for singletons** | `resource "aws_vpc" "this"` — standard Go-style convention |
+| **No provider or backend** | Caller controls these |
+
+---
+
+## Module vs Root Module — What's Different
+
+| | Root Module | Reusable Module |
+|--|--|--|
+| Has `provider.tf`? | ✅ Yes | ❌ No |
+| Has `backend`? | ✅ Yes | ❌ No |
+| Has `terraform.tfvars`? | ✅ Yes | ❌ No |
+| Called by? | `terraform apply` | `module "name" { source = ... }` |
+| State stored? | ✅ Yes | ❌ No (caller's state) |

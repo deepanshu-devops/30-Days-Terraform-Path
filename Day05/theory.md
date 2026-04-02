@@ -1,203 +1,232 @@
 # Day 05 — Variables, Outputs & Locals
 
-## 5W + 1H
+## Real-Life Example 🏗️
 
-### WHAT
+**Scenario:** You manage infrastructure for three environments — dev, staging, and production — all with the same network layout but different sizes.
 
-#### Variables (Inputs)
-Variables allow external values to be passed into Terraform configuration.
+**Without variables:** Three separate copies of nearly identical code. Fix one bug → update three files → miss one → it breaks.
 
+**With variables + tfvars:**
+```bash
+terraform apply -var-file="envs/dev.tfvars"     # cheap: t3.micro, 1 subnet
+terraform apply -var-file="envs/staging.tfvars" # medium: t3.small, 2 subnets
+terraform apply -var-file="envs/prod.tfvars"    # HA: t3.large, 3 subnets, NAT
+```
+
+One codebase. Three environments. Zero duplication.
+
+---
+
+## Variables — Inputs to Your Configuration
+
+Variables are parameters your Terraform configuration accepts from outside.
+
+### Basic Syntax
 ```hcl
 variable "environment" {
-  description = "Deployment environment"
+  description = "Deployment environment — drives instance sizing and HA"
   type        = string
-  default     = "dev"
+  default     = "dev"    # optional — if omitted, Terraform will prompt you
+}
 
+# Reference: var.environment
+```
+
+### All Variable Types
+```hcl
+variable "name"      { type = string }                     # "my-app"
+variable "port"      { type = number }                     # 8080
+variable "enabled"   { type = bool   }                     # true
+variable "zones"     { type = list(string) }               # ["us-east-1a", "us-east-1b"]
+variable "tags"      { type = map(string) }                # {env="dev", team="platform"}
+variable "db_config" {
+  type = object({
+    engine  = string
+    version = string
+    size    = string
+  })
+  default = { engine = "postgres", version = "15.4", size = "db.t3.micro" }
+}
+```
+
+### Validation — Catch Mistakes at Plan Time
+```hcl
+variable "environment" {
+  type    = string
+  default = "dev"
   validation {
-    condition     = contains(["dev", "staging", "production"], var.environment)
-    error_message = "Must be dev, staging, or production."
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Must be dev, staging, or prod. Got: ${var.environment}"
+  }
+}
+
+variable "vpc_cidr" {
+  type = string
+  validation {
+    condition     = can(cidrhost(var.vpc_cidr, 0))
+    error_message = "vpc_cidr must be a valid CIDR block like 10.0.0.0/16."
   }
 }
 ```
 
-**Variable types:**
-```hcl
-variable "string_var"  { type = string }
-variable "number_var"  { type = number }
-variable "bool_var"    { type = bool }
-variable "list_var"    { type = list(string) }
-variable "map_var"     { type = map(string) }
-variable "set_var"     { type = set(string) }
-variable "tuple_var"   { type = tuple([string, number, bool]) }
-variable "object_var"  {
-  type = object({
-    name     = string
-    port     = number
-    enabled  = bool
-  })
-}
+If someone passes `environment = "production"` (instead of `prod`), they get a clear error message at plan time — not a confusing AWS error after 5 minutes of resource creation.
+
+### How to Pass Values — Priority Order (highest wins)
+
+| Priority | Method | Example |
+|----------|--------|---------|
+| 1 (highest) | `-var` CLI flag | `terraform apply -var="env=prod"` |
+| 2 | `-var-file` CLI flag | `terraform apply -var-file="prod.tfvars"` |
+| 3 | `*.auto.tfvars` files | auto-loaded alphabetically |
+| 4 | `terraform.tfvars` | auto-loaded if present |
+| 5 | `TF_VAR_name` env var | `export TF_VAR_db_password="secret"` |
+| 6 (lowest) | `default` in variable block | fallback when nothing else set |
+
+**For CI/CD secrets:** Use environment variables so nothing is written to disk:
+```bash
+export TF_VAR_db_password="$(aws secretsmanager get-secret-value   --secret-id prod/db/password --query SecretString --output text)"
+terraform apply
 ```
 
-**Variable precedence (highest wins):**
-1. `-var` CLI flag
-2. `-var-file` CLI flag  
-3. `*.auto.tfvars` files (alphabetical)
-4. `terraform.tfvars`
-5. Environment variables (`TF_VAR_name`)
-6. Default value in variable block
+---
 
-#### Locals (Computed Values)
-Locals are named values computed within the configuration — not inputs, not outputs.
+## Locals — Internal Computed Values
+
+Locals are named values you compute once inside the configuration and reference anywhere. They are not inputs (users can't override them) and not outputs (they don't appear after apply).
 
 ```hcl
 locals {
-  # Simple computed value
+  # Build a consistent name prefix — used in every resource name
   name_prefix = "${var.project}-${var.environment}"
-  
-  # Conditional
-  instance_type = var.environment == "production" ? "t3.large" : "t3.micro"
-  
-  # Map of common tags — DRY principle
-  common_tags = {
-    Project     = var.project
-    Environment = var.environment
-    ManagedBy   = "Terraform"
-    Owner       = var.owner_email
-  }
-  
-  # Computed from data sources
-  azs = slice(data.aws_availability_zones.available.names, 0, 3)
+
+  # Environment-driven sizing — decide once, use everywhere
+  instance_type  = var.environment == "prod" ? "t3.large" : "t3.micro"
+  subnet_count   = var.environment == "prod" ? 3 : 2
+  multi_az       = var.environment == "prod"
+
+  # Merge default tags with user-supplied extras
+  # User-supplied tags win if there's a key conflict
+  common_tags = merge(
+    {
+      Project     = var.project
+      Environment = var.environment
+      ManagedBy   = "Terraform"
+      Owner       = var.owner_email
+    },
+    var.additional_tags
+  )
+
+  # Compute subnet CIDRs automatically from the VPC CIDR
+  subnet_cidrs = [
+    for i in range(local.subnet_count) : cidrsubnet(var.vpc_cidr, 8, i + 1)
+  ]
 }
+
+# Usage: local.name_prefix, local.instance_type, local.common_tags
 ```
 
-#### Outputs (Exports)
-Outputs expose values after apply — for humans, scripts, or other Terraform modules.
+**Why locals instead of repeating the expression?**
+- Define `local.name_prefix` once → every resource name updates when you change `var.project`
+- Define `local.common_tags` once → add a new required tag in one place, not 40 resource blocks
+
+---
+
+## Outputs — Values Exposed After Apply
+
+Outputs are values Terraform prints after `apply`. They are readable by other modules and automation scripts.
 
 ```hcl
 output "vpc_id" {
-  description = "The ID of the VPC"
+  description = "VPC ID — pass this to EKS, RDS, and ALB modules"
   value       = aws_vpc.main.id
 }
 
-output "database_password" {
-  description = "The database password (sensitive)"
-  value       = aws_db_instance.main.password
-  sensitive   = true  # Redacted in plan/apply output; still in state
+output "private_subnet_ids" {
+  description = "Private subnet IDs — required for EKS node groups and RDS"
+  value       = aws_subnet.private[*].id
 }
 
-# Structured output
-output "subnet_ids" {
-  description = "List of all subnet IDs"
-  value       = aws_subnet.main[*].id
+# Sensitive output — shown as <sensitive> in plan/apply
+output "db_password" {
+  description = "Database master password — accessible via: terraform output -raw db_password"
+  value       = aws_db_instance.main.password
+  sensitive   = true
+}
+```
+
+### Reading Outputs After Apply
+```bash
+terraform output                        # all outputs (sensitive shown as <sensitive>)
+terraform output vpc_id                 # single output value
+terraform output -raw db_password       # raw value (no quotes — safe for scripting)
+terraform output -json                  # all outputs as JSON for automation
+```
+
+### Cross-Module Output Sharing
+```hcl
+# In the VPC stack: output the subnet IDs
+output "private_subnet_ids" {
+  value = aws_subnet.private[*].id
+}
+
+# In the EKS stack: read the VPC stack's outputs
+data "terraform_remote_state" "vpc" {
+  backend = "s3"
+  config  = {
+    bucket = "my-org-terraform-state"
+    key    = "prod/vpc/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
+module "eks" {
+  subnet_ids = data.terraform_remote_state.vpc.outputs.private_subnet_ids
 }
 ```
 
 ---
 
-## Audience-Level Explanations
+## The Pattern: Variables → Locals → Outputs
 
-### 🟢 Beginner
-Variables = function parameters. Outputs = function return values. Locals = local variables inside the function.
-
-```hcl
-# Without variables (bad):
-resource "aws_vpc" "main" { cidr_block = "10.0.0.0/16" }
-resource "aws_vpc" "prod" { cidr_block = "10.1.0.0/16" }  # Copy-paste!
-
-# With variables (good):
-variable "cidr_block" { type = string }
-resource "aws_vpc" "main" { cidr_block = var.cidr_block }
+```
+variables.tf              main.tf                outputs.tf
+────────────              ───────                ──────────
+var.project      →   local.name_prefix    →   output "vpc_name"
+var.environment  →   local.common_tags    →   output "common_tags"
+var.vpc_cidr     →   aws_vpc.main         →   output "vpc_id"
+var.subnet_count →   aws_subnet.public[n] →   output "subnet_ids"
 ```
 
-### 🔵 Intermediate
+---
 
-**terraform.tfvars pattern for multi-environment:**
-```
-environments/
-  dev.tfvars      # environment = "dev", instance_type = "t3.micro"
-  staging.tfvars  # environment = "staging", instance_type = "t3.small"
-  prod.tfvars     # environment = "production", instance_type = "t3.large"
-```
+## Testing Expressions with `terraform console`
+
+Before writing a complex local or function, test it interactively:
 
 ```bash
-terraform apply -var-file="prod.tfvars"
-```
+terraform apply  # apply first so variables are loaded
+terraform console
 
-**Environment variable injection (for CI/CD secrets):**
-```bash
-export TF_VAR_db_password="supersecret"
-terraform apply  # Picks up TF_VAR_db_password automatically
-```
+> var.environment
+"dev"
 
-### 🟠 Advanced
+> local.name_prefix
+"day05-dev"
 
-**Complex variable types with defaults:**
-```hcl
-variable "node_groups" {
-  type = map(object({
-    instance_type = string
-    min_size      = number
-    max_size      = number
-    desired_size  = number
-  }))
-  default = {
-    general = {
-      instance_type = "t3.medium"
-      min_size      = 2
-      max_size      = 10
-      desired_size  = 3
-    }
-    memory = {
-      instance_type = "r6i.large"
-      min_size      = 1
-      max_size      = 5
-      desired_size  = 2
-    }
-  }
-}
-```
+> local.subnet_cidrs
+[
+  "10.0.1.0/24",
+  "10.0.2.0/24",
+]
 
-**Output dependencies:**
-Outputs can reference any resource attribute, including computed ones:
-```hcl
-output "alb_dns_name" {
-  value = aws_lb.main.dns_name  # Known only after apply
-}
-```
+> cidrsubnet("10.0.0.0/16", 8, 5)
+"10.0.5.0/24"
 
-### 🔴 Expert
+> merge({a=1}, {b=2, a=99})
+{a=99, b=2}
 
-**Sensitive values handling:**
-- `sensitive = true` on a variable: value is redacted in logs
-- `sensitive = true` on an output: value is redacted in plan output
-- Values are still in `.tfstate` — state itself must be encrypted
-- Use `nonsensitive()` builtin to explicitly unseal in contexts where you need to reference it
+> "prod" == "prod" ? "t3.large" : "t3.micro"
+"t3.large"
 
-**Variable validation with regex:**
-```hcl
-variable "bucket_name" {
-  type = string
-  validation {
-    condition     = can(regex("^[a-z0-9-]{3,63}$", var.bucket_name))
-    error_message = "Bucket name must be 3-63 chars, lowercase letters, numbers, hyphens."
-  }
-}
-```
-
-**Output cross-module sharing:**
-```hcl
-# Root module: expose subnet IDs
-output "private_subnet_ids" {
-  value = module.vpc.private_subnet_ids
-}
-
-# In another root module: consume via remote state
-data "terraform_remote_state" "network" {
-  backend = "s3"
-  config  = { bucket = "my-state", key = "network/terraform.tfstate", region = "us-east-1" }
-}
-
-module "eks" {
-  subnet_ids = data.terraform_remote_state.network.outputs.private_subnet_ids
-}
+> exit
 ```

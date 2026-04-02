@@ -1,0 +1,91 @@
+# Day 15 — GitHub Actions Terraform CI/CD Pipeline
+# Copy this to .github/workflows/terraform.yml in your repo
+
+name: Terraform CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["Day15/code/**"]
+  push:
+    branches: [main]
+    paths: ["Day15/code/**"]
+
+env:
+  TF_VERSION: "1.6.0"
+  AWS_REGION: "us-east-1"
+  WORKING_DIR: "Day15/code"
+
+jobs:
+  terraform:
+    name: Plan & Apply
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write       # Required for OIDC auth (no static keys!)
+
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Step 2: Auth to AWS via OIDC (no access keys stored in GitHub)
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/TerraformCIRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Step 3: Install Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Step 4: Init
+      - name: Terraform Init
+        run: terraform init
+
+      # Step 5: Format check
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      # Step 6: Validate
+      - name: Terraform Validate
+        run: terraform validate
+
+      # Step 7: Plan (on PR only)
+      - name: Terraform Plan
+        if: github.event_name == 'pull_request'
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        continue-on-error: true
+
+      # Step 8: Comment plan on PR
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const planOutput = `${{ steps.plan.outputs.stdout }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '#### Terraform Plan\n```\n' + planOutput + '\n```'
+            });
+
+      # Step 9: Fail if plan failed
+      - name: Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      # Step 10: Apply (on merge to main only)
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve tfplan

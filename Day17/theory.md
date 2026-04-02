@@ -1,126 +1,123 @@
 # Day 17 — IAM Least Privilege with Terraform
 
-## WHAT
-Terraform needs AWS permissions to create, modify, and destroy resources. The principle of least privilege means Terraform gets only the permissions it actually needs — nothing more.
+## Real-Life Example 🏗️
 
-## Why Not Admin Access?
-- If Terraform credentials are compromised, attacker has admin access
-- Blast radius: a bug in code can accidentally delete anything
-- Compliance: most frameworks (SOC2, ISO27001) require least privilege
+**The Admin Access Incident:**  
+Your Terraform CI/CD pipeline uses an IAM user with `AdministratorAccess`.  
+A supply-chain attack compromises a dependency in your pipeline.  
+The attacker now has full AWS admin credentials. They spin up 500 GPU instances for crypto mining over a weekend.  
+Bill: $47,000.
+
+**With least privilege:**  
+The Terraform role can only create VPCs and EKS clusters. The attacker gets a role that can create a VPC. No GPU instances, no IAM users, no S3 data access. Blast radius: zero.
 
 ---
 
-## Step 1: Use IAM Roles, Not IAM Users
+## The Three Principles
+
+### 1. Use IAM Roles, Not IAM Users
+
+IAM users have permanent credentials. IAM roles have temporary, auto-expiring credentials.
 
 ```hcl
-# Terraform execution role — assumed by CI/CD
-resource "aws_iam_role" "terraform_execution" {
-  name = "TerraformExecutionRole"
+# CI/CD assumes this role via OIDC — no stored access keys anywhere
+resource "aws_iam_role" "terraform_ci" {
+  name = "TerraformCIRole"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        # Allow GitHub Actions OIDC to assume this role
-        Effect = "Allow"
-        Principal = {
-          Federated = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
-        Action = "sts:AssumeRoleWithWebIdentity"
-        Condition = {
-          StringEquals = {
-            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          }
-          StringLike = {
-            "token.actions.githubusercontent.com:sub" = "repo:myorg/myrepo:*"
-          }
+        StringLike = {
+          "token.actions.githubusercontent.com:sub" = "repo:myorg/myrepo:*"
         }
       }
-    ]
+    }]
   })
 }
 ```
 
-## Step 2: Scope Permissions to What Terraform Manages
+### 2. Scope Permissions to What Terraform Actually Needs
 
 ```hcl
-resource "aws_iam_policy" "terraform_vpc" {
-  name        = "TerraformVPCPolicy"
-  description = "Permissions for Terraform to manage VPC resources"
+resource "aws_iam_policy" "terraform_network" {
+  name        = "TerraformNetworkPolicy"
+  description = "Minimum permissions for managing VPC resources"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        # Only the specific API calls Terraform makes for VPC resources
+        "ec2:CreateVpc",         "ec2:DeleteVpc",         "ec2:DescribeVpcs",
+        "ec2:CreateSubnet",      "ec2:DeleteSubnet",      "ec2:DescribeSubnets",
+        "ec2:CreateRouteTable",  "ec2:DeleteRouteTable",  "ec2:DescribeRouteTables",
+        "ec2:CreateRoute",       "ec2:DeleteRoute",
+        "ec2:AssociateRouteTable","ec2:DisassociateRouteTable",
+        "ec2:CreateInternetGateway","ec2:DeleteInternetGateway",
+        "ec2:AttachInternetGateway","ec2:DetachInternetGateway",
+        "ec2:CreateSecurityGroup","ec2:DeleteSecurityGroup","ec2:DescribeSecurityGroups",
+        "ec2:AuthorizeSecurityGroupIngress","ec2:RevokeSecurityGroupIngress",
+        "ec2:CreateTags","ec2:DeleteTags","ec2:DescribeAvailabilityZones"
+      ]
+      Resource = "*"
+    }]
+  })
+}
+```
+
+### 3. Separate Roles Per Environment
+
+```
+TerraformRole-Dev (dev AWS account)
+  → Broad permissions (can experiment, break things)
+  → Can destroy and recreate freely
+
+TerraformRole-Staging (staging AWS account)
+  → Moderate permissions
+  → Destroy requires approval
+
+TerraformRole-Prod (prod AWS account)
+  → Narrow permissions (exactly what prod infra needs)
+  → All actions require MFA (if using console)
+  → `prevent_destroy = true` on all critical resources
+```
+
+---
+
+## State Backend Access Policy
+
+The Terraform role also needs access to read/write state:
+
+```hcl
+resource "aws_iam_policy" "terraform_state" {
+  name = "TerraformStateAccessPolicy"
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
-        Action = [
-          "ec2:CreateVpc", "ec2:DeleteVpc", "ec2:ModifyVpcAttribute",
-          "ec2:DescribeVpcs", "ec2:DescribeVpcAttribute",
-          "ec2:CreateSubnet", "ec2:DeleteSubnet", "ec2:ModifySubnetAttribute",
-          "ec2:DescribeSubnets",
-          "ec2:CreateInternetGateway", "ec2:DeleteInternetGateway",
-          "ec2:AttachInternetGateway", "ec2:DetachInternetGateway",
-          "ec2:DescribeInternetGateways",
-          "ec2:CreateRouteTable", "ec2:DeleteRouteTable",
-          "ec2:AssociateRouteTable", "ec2:DisassociateRouteTable",
-          "ec2:CreateRoute", "ec2:DeleteRoute",
-          "ec2:DescribeRouteTables",
-          "ec2:CreateTags", "ec2:DeleteTags",
-          "ec2:DescribeAvailabilityZones"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "terraform_vpc" {
-  role       = aws_iam_role.terraform_execution.name
-  policy_arn = aws_iam_policy.terraform_vpc.arn
-}
-```
-
-## Step 3: Separate Roles Per Environment
-
-```
-TerraformRole-Dev  (dev AWS account)
-  - Broad permissions
-  - Can destroy resources freely
-
-TerraformRole-Staging  (staging AWS account)
-  - Moderate permissions
-  - Requires MFA for destroy
-
-TerraformRole-Prod  (prod AWS account)
-  - Narrow permissions (only what's needed)
-  - Requires MFA + approval
-  - Deny delete on critical resources
-```
-
-## Step 4: Deny Critical Destructive Actions
-
-```hcl
-resource "aws_iam_policy" "terraform_deny_dangerous" {
-  name = "TerraformDenyDangerousActions"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "arn:aws:s3:::my-org-terraform-state/prod/*"
+        # Scoped to prod/ prefix only — can't read dev state
+      },
       {
-        Sid    = "DenyDangerousActions"
-        Effect = "Deny"
-        Action = [
-          "ec2:DeleteVpc",           # Can't delete VPCs
-          "rds:DeleteDBInstance",    # Can't delete RDS
-          "dynamodb:DeleteTable",    # Can't delete DynamoDB
-          "s3:DeleteBucket"          # Can't delete S3 buckets
-        ]
-        Resource = "*"
-        Condition = {
-          "BoolIfExists" = {
-            "aws:MultiFactorAuthPresent" = "false"
-          }
-        }
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket", "s3:GetBucketVersioning"]
+        Resource = "arn:aws:s3:::my-org-terraform-state"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"]
+        Resource = "arn:aws:dynamodb:us-east-1:*:table/terraform-state-lock"
       }
     ]
   })
@@ -129,16 +126,40 @@ resource "aws_iam_policy" "terraform_deny_dangerous" {
 
 ---
 
-## Audience Levels
+## Verifying Permissions Without Applying
 
-### 🟢 Beginner
-Think of IAM as a keycard system. Terraform needs a keycard that opens only the rooms it needs to work in — not the master keycard that opens everything.
+```bash
+# Test if the role can create a VPC (should be allowed)
+aws iam simulate-principal-policy   --policy-source-arn arn:aws:iam::ACCOUNT:role/TerraformCIRole   --action-names ec2:CreateVpc   --resource-arns "*"   --query "EvaluationResults[].EvalDecision"
+# → "allowed"
 
-### 🔵 Intermediate
-Start with AWS-managed policies for common services (AmazonEC2FullAccess, etc.) during development. Lock down to custom policies before production. Use IAM Access Analyzer to find unused permissions.
+# Test if the role can create an IAM user (should be denied)
+aws iam simulate-principal-policy   --policy-source-arn arn:aws:iam::ACCOUNT:role/TerraformCIRole   --action-names iam:CreateUser   --resource-arns "*"   --query "EvaluationResults[].EvalDecision"
+# → "implicitDeny"
+```
 
-### 🟠 Advanced
-Use permission boundaries on the Terraform role: even if the policy says Allow, the boundary caps what the role can do. Useful for restricting Terraform from creating overly-powerful IAM roles.
+---
 
-### 🔴 Expert
-Use AWS IAM policy simulator to test your policies before applying. Build a policy generation pipeline: parse Terraform plan output → extract resource types → generate minimum required IAM policy automatically.
+## Permission Boundaries (Advanced)
+
+Even if someone gives the Terraform role extra permissions, a boundary caps what it can do:
+
+```hcl
+resource "aws_iam_role" "terraform_ci" {
+  permissions_boundary = aws_iam_policy.terraform_boundary.arn
+
+  # Even if someone attaches AdministratorAccess to this role,
+  # the boundary ensures it can never exceed the boundary policy
+}
+
+resource "aws_iam_policy" "terraform_boundary" {
+  name = "TerraformPermissionBoundary"
+  policy = jsonencode({
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ec2:*", "eks:*", "rds:*"]   # max allowed — nothing outside this
+      Resource = "*"
+    }]
+  })
+}
+```

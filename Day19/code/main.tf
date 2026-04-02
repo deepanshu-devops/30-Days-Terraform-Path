@@ -1,73 +1,52 @@
 ################################################################################
-# Day 19 — Security-Compliant Terraform Config
-# Run checkov and tfsec against this to see zero findings
+# Day19 — main.tf
+# Topic: Security Scanning: Checkov & tfsec
+# Real-life: Security Scanning: A developer creates an RDS instance with publicly_accessible = true. Without scanning: it goes to prod. With Checkov in CI/CD: the PR is blocked with CKV_AWS_17. The database is never exposed to the internet.
 ################################################################################
-terraform {
-  required_version = ">= 1.6.0"
-  required_providers {
-    aws = { source = "hashicorp/aws", version = "~> 5.0" }
-  }
-}
 
-provider "aws" { region = "us-east-1" }
-
+locals { name_prefix = "${var.project}-${var.environment}" }
 resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags = { Name = "day19-vpc", ManagedBy = "Terraform" }
+  tags                 = { Name = "${local.name_prefix}-vpc" }
 }
-
-# S3 bucket with all security controls enabled (passes all Checkov checks)
+# Security group following ALL Checkov/tfsec rules
+resource "aws_security_group" "web" {
+  name        = "${local.name_prefix}-web-sg"
+  description = "Web tier — HTTPS only inbound"   # description is required (CKV_AWS_23)
+  vpc_id      = aws_vpc.main.id
+  ingress {
+    from_port   = 443; to_port = 443; protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]; description = "HTTPS from internet"
+  }
+  # Port 22 is NOT open — SSH access via SSM Session Manager instead
+  egress {
+    from_port = 0; to_port = 0; protocol = "-1"; cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound"
+  }
+  tags = { Name = "${local.name_prefix}-web-sg" }
+}
 resource "aws_s3_bucket" "secure" {
-  bucket        = "day19-secure-bucket-example"
+  bucket        = "${local.name_prefix}-secure-data"
   force_destroy = true
-  tags          = { Name = "day19-secure", Environment = "learning" }
+  tags          = { Name = "${local.name_prefix}-secure", Environment = var.environment }
 }
-
+resource "aws_s3_bucket_server_side_encryption_configuration" "secure" {
+  bucket = aws_s3_bucket.secure.id
+  rule   { apply_server_side_encryption_by_default { sse_algorithm = "AES256" }; bucket_key_enabled = true }
+}
 resource "aws_s3_bucket_versioning" "secure" {
   bucket = aws_s3_bucket.secure.id
   versioning_configuration { status = "Enabled" }
 }
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "secure" {
-  bucket = aws_s3_bucket.secure.id
-  rule {
-    apply_server_side_encryption_by_default { sse_algorithm = "AES256" }
-    bucket_key_enabled = true
-  }
-}
-
 resource "aws_s3_bucket_public_access_block" "secure" {
   bucket = aws_s3_bucket.secure.id
   block_public_acls = true; block_public_policy = true
   ignore_public_acls = true; restrict_public_buckets = true
 }
-
 resource "aws_s3_bucket_logging" "secure" {
   bucket        = aws_s3_bucket.secure.id
   target_bucket = aws_s3_bucket.secure.id
   target_prefix = "access-logs/"
 }
-
-# Security group following least privilege
-resource "aws_security_group" "web" {
-  name        = "day19-web-sg"
-  description = "Web tier - HTTPS only"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    from_port   = 443; to_port = 443; protocol = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]; description = "HTTPS"
-  }
-  # No port 22 / SSH open to internet
-  egress {
-    from_port = 0; to_port = 0; protocol = "-1"
-    cidr_blocks = ["0.0.0.0/0"]; description = "All outbound"
-  }
-  tags = { Name = "day19-web-sg" }
-}
-
-output "vpc_id"         { value = aws_vpc.main.id }
-output "bucket_name"   { value = aws_s3_bucket.secure.bucket }
-output "security_group" { value = aws_security_group.web.id }

@@ -1,99 +1,162 @@
 # Day 20 — Terraform Testing with Terratest
 
-## WHAT
-Terratest is a Go library for writing automated tests for Terraform modules. It deploys real infrastructure, validates it works, then destroys it.
+## Real-Life Example 🏗️
 
-## Test Types
+**The Broken Module Release:**  
+You update the shared VPC module to support IPv6. You tag v1.3.0. Teams start upgrading.
 
-### 1. Unit Tests (terraform validate + plan)
-```bash
-terraform validate   # Syntax check
-terraform plan       # Logic check — no real infra
+Three teams report the same bug: subnets are being created in the wrong availability zones. The `element()` function in your fix has an off-by-one error that only shows up with 3+ AZs.
+
+You never tested with 3 AZs before tagging. Now you need v1.3.1 and 3 teams need emergency rollbacks.
+
+**With Terratest:**  
+Before tagging v1.3.0, your CI pipeline deploys the module to a real AWS account with 3 AZs, checks that `subnet[0].availability_zone == "us-east-1a"`, runs assertions on all outputs, then destroys everything. The off-by-one is caught. v1.3.0 is never tagged.
+
+---
+
+## Testing Pyramid for Terraform
+
+```
+Level 3 — Integration Tests (Terratest)
+  Deploy real infra → validate it works → destroy
+  Time: 5-20 minutes | Cost: ~$0.10 per run
+  When: On PR to main, before module version tagging
+
+Level 2 — Logic Tests (terraform plan)
+  Run plan and check output → no real infra
+  Time: 30-60 seconds | Cost: free
+  When: On every PR and commit
+
+Level 1 — Syntax/Security (validate + checkov)
+  Check syntax, linting, security rules
+  Time: 5-15 seconds | Cost: free
+  When: On every commit, pre-commit hooks
 ```
 
-### 2. Integration Tests with Terratest
+Run all three layers. Don't skip any.
+
+---
+
+## Terratest: Go-Based Integration Testing
+
 ```go
 // test/vpc_test.go
 package test
 
 import (
-    "testing"
-    "github.com/gruntwork-io/terratest/modules/terraform"
-    "github.com/stretchr/testify/assert"
+  "testing"
+  "github.com/gruntwork-io/terratest/modules/terraform"
+  "github.com/gruntwork-io/terratest/modules/aws"
+  "github.com/stretchr/testify/assert"
 )
 
 func TestVpcModule(t *testing.T) {
-    t.Parallel()
+  t.Parallel()    // run multiple tests concurrently
 
-    terraformOptions := &terraform.Options{
-        TerraformDir: "../modules/vpc",
-        Vars: map[string]interface{}{
-            "name":               "test-vpc",
-            "cidr_block":         "10.0.0.0/16",
-            "availability_zones": []string{"us-east-1a", "us-east-1b"},
-            "public_subnet_cidrs": []string{"10.0.1.0/24", "10.0.2.0/24"},
-        },
-        EnvVars: map[string]string{
-            "AWS_DEFAULT_REGION": "us-east-1",
-        },
-    }
+  terraformOptions := &terraform.Options{
+    TerraformDir: "../code",
+    Vars: map[string]interface{}{
+      "aws_region":    "us-east-1",
+      "project":       "test",
+      "environment":   "test",
+      "vpc_cidr":      "10.99.0.0/16",    // unique CIDR for tests
+      "subnet_count":  3,
+    },
+    EnvVars: map[string]string{
+      "AWS_DEFAULT_REGION": "us-east-1",
+    },
+  }
 
-    // Ensure destroy runs even if test fails
-    defer terraform.Destroy(t, terraformOptions)
+  // ALWAYS defer destroy — ensures cleanup even if test panics
+  defer terraform.Destroy(t, terraformOptions)
 
-    // Deploy
-    terraform.InitAndApply(t, terraformOptions)
+  // Deploy
+  terraform.InitAndApply(t, terraformOptions)
 
-    // Validate outputs
-    vpcID := terraform.Output(t, terraformOptions, "vpc_id")
-    assert.NotEmpty(t, vpcID, "VPC ID should not be empty")
-    assert.Regexp(t, "^vpc-", vpcID, "VPC ID should start with vpc-")
+  // Assert: VPC ID exists and has correct format
+  vpcID := terraform.Output(t, terraformOptions, "vpc_id")
+  assert.NotEmpty(t, vpcID)
+  assert.Regexp(t, `^vpc-`, vpcID)
 
-    subnetIDs := terraform.OutputList(t, terraformOptions, "public_subnet_ids")
-    assert.Equal(t, 2, len(subnetIDs), "Should have 2 public subnets")
+  // Assert: VPC CIDR matches input
+  vpcCIDR := terraform.Output(t, terraformOptions, "vpc_cidr")
+  assert.Equal(t, "10.99.0.0/16", vpcCIDR)
+
+  // Assert: correct number of subnets
+  subnetIDs := terraform.OutputList(t, terraformOptions, "public_subnet_ids")
+  assert.Equal(t, 3, len(subnetIDs))
+
+  // Assert: VPC actually exists in AWS (not just in state)
+  vpc := aws.GetVpcById(t, vpcID, "us-east-1")
+  assert.Equal(t, "available", *vpc.State)
 }
 ```
 
 ```bash
 # Run tests
 cd test
-go test -v -timeout 30m ./...
+go mod init test
+go get github.com/gruntwork-io/terratest/modules/terraform
+go get github.com/stretchr/testify/assert
+go test -v -timeout 30m -run TestVpcModule ./...
 
-# Run a specific test
-go test -v -run TestVpcModule -timeout 30m ./...
-```
-
-### 3. Checkov for Policy Tests
-```bash
-checkov -d ./modules/vpc --framework terraform
-# Fails CI if any HIGH/CRITICAL findings
-```
-
-## Test Pyramid
-
-```
-         /\
-        /  \
-       / E2E\     Full environment tests (slow, expensive)
-      /------\
-     /  Integ \   Terratest module tests (minutes)
-    /----------\
-   /    Unit    \  validate + plan (seconds, free)
-  /--------------\
+# Run all tests in parallel
+go test -v -timeout 60m -count=1 -parallel 10 ./...
 ```
 
 ---
 
-## Audience Levels
+## Test Directory Structure
 
-### 🟢 Beginner
-Start with `terraform validate` and `terraform plan` in CI. That catches 80% of issues. Graduate to Terratest when you have stable modules.
+```
+Day20/
+  code/
+    provider.tf
+    variables.tf
+    main.tf
+    outputs.tf
+    terraform.tfvars
+  test/
+    go.mod
+    go.sum
+    vpc_test.go
+    helpers_test.go    # shared test utilities
+```
 
-### 🔵 Intermediate
-Write one Terratest test per module. Run them on PR to the module repo. Use `t.Parallel()` to run tests concurrently. Use separate AWS account for test runs.
+---
 
-### 🟠 Advanced
-Use `terraform-docs` to auto-generate README. Use `tflint` for additional linting. Build a test fixture pattern: modules have a `test/fixtures/` directory with minimal configs for testing.
+## GitHub Actions: Run Tests on PR
 
-### 🔴 Expert
-Build a test pipeline: validate → plan → security scan → cost estimate → integration test → promote to staging. Use AWS Nuke or Terratest's `aws.DeleteAllResourcesInRegion()` to clean up orphaned test resources.
+```yaml
+- name: Run Terratest
+  run: |
+    cd test
+    go test -v -timeout 30m -run TestVpcModule ./...
+  env:
+    AWS_DEFAULT_REGION: us-east-1
+    # AWS credentials via OIDC (no static keys)
+```
+
+---
+
+## What to Test
+
+```go
+// Test outputs exist and have correct format
+assert.Regexp(t, `^vpc-`, vpcID)
+assert.Regexp(t, `^subnet-`, subnetIDs[0])
+
+// Test count matches input
+assert.Equal(t, vars["subnet_count"], len(subnetIDs))
+
+// Test CIDR matches input
+assert.Equal(t, vars["vpc_cidr"], vpcCIDR)
+
+// Test real infrastructure state via AWS SDK
+vpc := aws.GetVpcById(t, vpcID, region)
+assert.Equal(t, "available", *vpc.State)
+assert.True(t, *vpc.EnableDnsHostnames)
+
+// Test no resources were accidentally left from a previous failed run
+// (use unique prefixes with random suffixes to prevent naming conflicts)
+```

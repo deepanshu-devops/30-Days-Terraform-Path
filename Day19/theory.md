@@ -1,108 +1,153 @@
 # Day 19 — Security Scanning: Checkov & tfsec
 
-## WHAT
-Static analysis tools that scan Terraform code for security misconfigurations — before apply, in the IDE, and in CI/CD.
+## Real-Life Example 🏗️
 
-## Checkov
+**The Misconfiguration That Made It to Production:**  
+A developer creates an EC2 instance. They add a security group that opens port 22 to 0.0.0.0/0 for debugging. "I'll close it after testing." They forget.
 
-```bash
-pip install checkov
+Three months later: a security audit finds the open SSH port. No breach occurred, but remediation requires a change window, a PR, a review, a deployment. Two hours of work.
 
-# Scan a directory
-checkov -d ./terraform --framework terraform
+With Checkov in CI/CD: the PR is blocked the moment the security group is created. Error message: `CKV_AWS_25: Ensure no security groups allow ingress from 0.0.0.0:0 to port 22`. The developer sees it immediately, fixes it in 2 minutes, never reaches prod.
 
-# Output formats
-checkov -d . --output json        # JSON (for CI/CD integration)
-checkov -d . --output sarif       # SARIF (for GitHub Security tab)
-checkov -d . --output github_failed_only  # Only show failures
+**Finding a misconfiguration in code review costs minutes. Finding it in production costs hours — or worse.**
 
-# Skip specific checks
-checkov -d . --skip-check CKV_AWS_18,CKV_AWS_21
+---
 
-# Run specific checks only
-checkov -d . --check CKV_AWS_2,CKV_AWS_3
-```
+## Checkov — Comprehensive IaC Scanner
 
-**Common Checkov findings:**
-| Check ID | Description |
-|---|---|
-| CKV_AWS_2 | ALB Listener uses HTTPS |
-| CKV_AWS_18 | S3 bucket has access logging |
-| CKV_AWS_21 | S3 bucket has versioning |
-| CKV_AWS_53 | S3 bucket has public access blocked |
-| CKV_AWS_16 | RDS database not publicly accessible |
-| CKV_AWS_17 | RDS database storage encrypted |
-| CKV_AWS_23 | RDS has deletion protection |
-| CKV_AWS_79 | EC2 not using default VPC |
-
-## tfsec
+Checkov scans Terraform, CloudFormation, Kubernetes, and more. 1,000+ built-in security and compliance rules.
 
 ```bash
 # Install
-brew install tfsec
-# or
-go install github.com/aquasecurity/tfsec/cmd/tfsec@latest
+pip install checkov
 
 # Basic scan
-tfsec ./terraform
+checkov -d . --framework terraform
 
-# Filter by severity
-tfsec . --minimum-severity HIGH
+# Example output:
+# Check: CKV_AWS_16: "Ensure that RDS database is not publicly accessible"
+# FAILED for resource: aws_db_instance.main
+# File: /code/main.tf:45
+# Guide: https://docs.bridgecrew.io/docs/bc_aws_general_2
 
-# Output as JSON
-tfsec . --format json
+# Check: CKV_AWS_53: "Ensure S3 bucket has block public ACLS"
+# PASSED for resource: aws_s3_bucket.logs
 
-# Ignore specific rule in code:
-#tfsec:ignore:aws-s3-enable-bucket-logging
-resource "aws_s3_bucket" "internal_only" { ... }
-```
+# Passed checks: 12, Failed checks: 1
 
-## In CI/CD (GitHub Actions)
+# Fail only on HIGH and CRITICAL, warn on lower
+checkov -d . --framework terraform   --check CKV_AWS_16,CKV_AWS_17,CKV_AWS_53   --compact
 
-```yaml
-- name: Run Checkov
-  uses: bridgecrewio/checkov-action@master
-  with:
-    directory: terraform/
-    framework: terraform
-    output_format: sarif
-    output_file_path: checkov-results.sarif
-    soft_fail: false
-
-- name: Upload Checkov results to GitHub Security
-  uses: github/codeql-action/upload-sarif@v2
-  with:
-    sarif_file: checkov-results.sarif
-
-- name: Run tfsec
-  uses: aquasecurity/tfsec-action@v1.0.0
-  with:
-    working_directory: terraform/
-    minimum_severity: HIGH
-```
-
-## Trivy (Emerging Standard)
-
-```bash
-# Trivy now covers IaC scanning (replaces tfsec from Aqua Security)
-trivy config ./terraform
-
-# With severity filter
-trivy config --severity HIGH,CRITICAL ./terraform
+# Output as SARIF (shows in GitHub Security tab)
+checkov -d . --output sarif --output-file-path checkov-results.sarif
 ```
 
 ---
 
-## Audience Levels
+## tfsec — Fast Terraform-Specific Scanner
 
-### 🟢 Beginner
-Run `checkov -d .` in your Terraform directory right now. It will show you every security issue. Fix them one by one. It teaches you security as you go.
+tfsec is faster than Checkov and focused purely on Terraform. Great for quick CI/CD checks.
 
-### 🔵 Intermediate
-Add Checkov and tfsec to your PR pipeline. Configure HIGH and CRITICAL findings to block merge. MEDIUM findings as warnings. Review the findings list — some may be false positives for your context.
+```bash
+# Install
+brew install tfsec
 
-### 🟠 Advanced
-Build a custom Checkov check for your organization's specific rules (e.g., required tags, specific KMS keys). Checkov supports custom Python checks.
+# Scan
+tfsec . --minimum-severity HIGH
 
-### 🔴 Expert
-Feed Checkov/tfsec SARIF output into GitHub Code Scanning or SonarQube. Track security debt over time. Build a policy exception workflow: teams can request exceptions with business justification, tracked as GitHub issues.
+# Ignore a specific rule inline (with justification)
+#tfsec:ignore:aws-s3-enable-bucket-logging  -- internal bucket, logging not needed
+resource "aws_s3_bucket" "build_artifacts" { ... }
+
+# JSON output for CI/CD parsing
+tfsec . --format json --out results.json
+
+# Only fail on HIGH and CRITICAL
+tfsec . --minimum-severity HIGH
+```
+
+---
+
+## Most Critical Checkov Rules
+
+| Check ID | Rule | Why It Matters |
+|----------|------|---------------|
+| `CKV_AWS_16` | RDS `publicly_accessible = false` | Database exposure |
+| `CKV_AWS_17` | RDS `storage_encrypted = true` | Data at rest compliance |
+| `CKV_AWS_18` | S3 access logging enabled | Audit trail |
+| `CKV_AWS_21` | S3 versioning enabled | Data recovery |
+| `CKV_AWS_53` | S3 public access block | Data exposure |
+| `CKV_AWS_79` | EC2 not in default VPC | Security boundary |
+| `CKV_AWS_23` | RDS `deletion_protection = true` | Prevent accidents |
+| `CKV_AWS_25` | No SG ingress port 22 from 0.0.0.0/0 | Attack surface |
+| `CKV_AWS_130` | S3 `server_side_encryption_configuration` | Data at rest |
+| `CKV_AWS_3` | SG no unrestricted ingress | Attack surface |
+
+---
+
+## CI/CD Integration — GitHub Actions
+
+```yaml
+- name: Checkov Security Scan
+  uses: bridgecrewio/checkov-action@master
+  with:
+    directory: .
+    framework: terraform
+    output_format: sarif
+    output_file_path: checkov.sarif
+    soft_fail: false    # fail the PR on findings
+
+- name: Upload to GitHub Security Tab
+  uses: github/codeql-action/upload-sarif@v2
+  if: always()
+  with:
+    sarif_file: checkov.sarif
+```
+
+---
+
+## CI/CD Integration — Jenkins
+
+```groovy
+stage("Security Scanning") {
+  parallel {
+    stage("Checkov") {
+      steps { sh "checkov -d . --quiet --compact --framework terraform" }
+    }
+    stage("tfsec") {
+      steps { sh "tfsec . --minimum-severity HIGH" }
+    }
+  }
+}
+```
+
+Run both in parallel — total time ~30 seconds. Blocks any PR with HIGH or CRITICAL security findings.
+
+---
+
+## Writing Compliant Code From the Start
+
+```hcl
+# Follow these patterns and you'll pass most scans automatically
+
+# S3: the checklist
+resource "aws_s3_bucket" "example" { bucket = "..." }
+resource "aws_s3_bucket_versioning" "example" {                             # CKV_AWS_21
+  bucket = aws_s3_bucket.example.id
+  versioning_configuration { status = "Enabled" }
+}
+resource "aws_s3_bucket_server_side_encryption_configuration" "example" {   # CKV_AWS_17
+  bucket = aws_s3_bucket.example.id
+  rule { apply_server_side_encryption_by_default { sse_algorithm = "AES256" } }
+}
+resource "aws_s3_bucket_public_access_block" "example" {                    # CKV_AWS_53
+  bucket = aws_s3_bucket.example.id
+  block_public_acls = true; block_public_policy = true
+  ignore_public_acls = true; restrict_public_buckets = true
+}
+resource "aws_s3_bucket_logging" "example" {                                # CKV_AWS_18
+  bucket = aws_s3_bucket.example.id
+  target_bucket = aws_s3_bucket.example.id
+  target_prefix = "logs/"
+}
+```

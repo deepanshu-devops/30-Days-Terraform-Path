@@ -1,0 +1,92 @@
+// Day 15 — Jenkins Declarative Pipeline for Terraform
+// Add this as Jenkinsfile in your repo root
+
+pipeline {
+    agent any
+
+    environment {
+        TF_VERSION  = "1.6.0"
+        AWS_REGION  = "us-east-1"
+        WORKING_DIR = "Day15/code"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Setup Terraform') {
+            steps {
+                sh '''
+                    wget -q https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip
+                    unzip -o terraform_${TF_VERSION}_linux_amd64.zip -d /usr/local/bin/
+                    terraform version
+                '''
+            }
+        }
+
+        stage('Init') {
+            steps {
+                dir(env.WORKING_DIR) {
+                    withAWS(role: 'TerraformCIRole', region: env.AWS_REGION) {
+                        sh 'terraform init'
+                    }
+                }
+            }
+        }
+
+        stage('Validate & Format') {
+            steps {
+                dir(env.WORKING_DIR) {
+                    sh 'terraform validate'
+                    sh 'terraform fmt -check'
+                }
+            }
+        }
+
+        stage('Plan') {
+            steps {
+                dir(env.WORKING_DIR) {
+                    withAWS(role: 'TerraformCIRole', region: env.AWS_REGION) {
+                        sh 'terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt'
+                        archiveArtifacts artifacts: 'Day15/code/plan.txt'
+                    }
+                }
+            }
+        }
+
+        stage('Human Approval') {
+            when { branch 'main' }
+            steps {
+                // Shows plan.txt to approver before allowing apply
+                script {
+                    def planText = readFile('Day15/code/plan.txt')
+                    input message: "Review the plan below and approve:
+
+${planText}", ok: "Approve Apply"
+                }
+            }
+        }
+
+        stage('Apply') {
+            when { branch 'main' }
+            steps {
+                dir(env.WORKING_DIR) {
+                    withAWS(role: 'TerraformCIRole', region: env.AWS_REGION) {
+                        sh 'terraform apply tfplan'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            emailext(
+                subject: "Terraform Apply FAILED — ${env.JOB_NAME}",
+                body: "Build URL: ${env.BUILD_URL}",
+                to: 'devops-team@company.com'
+            )
+        }
+    }
+}

@@ -1,134 +1,142 @@
 # Day 22 — Provisioning EKS End-to-End with Terraform
 
-## WHAT
-A production EKS cluster requires: VPC, subnets, EKS control plane, managed node groups, OIDC provider, IRSA (IAM Roles for Service Accounts), and core add-ons.
+## Real-Life Example 🏗️
 
-## Architecture
+**The Manual EKS Setup:**  
+Setting up EKS in the console for the first time: 45 minutes, 30+ configuration decisions. OIDC setup, security groups, IAM roles, node group parameters, add-on versions.
+
+Setting up the second EKS cluster: 40 minutes — you remember most of it.  
+The third: 35 minutes — but it has slightly different node sizing than the second because you forgot.
+
+Three clusters, three slightly different configurations. When a CVE requires updating kube-proxy on all three, you update each one differently.
+
+**With Terraform:**  
+All three clusters are defined in code. Same module, different inputs. Update the module → all three clusters get identical updates. Provisioning time: 10 minutes per cluster.
+
+At Amdocs: we provision EKS clusters that handle 200K+ concurrent sessions. All via this pattern.
+
+---
+
+## What a Production EKS Cluster Requires
 
 ```
-VPC (10.0.0.0/16)
-  ├── Public Subnets  (NAT Gateways, Load Balancers)
-  └── Private Subnets (EKS Nodes — NEVER public)
-        └── EKS Cluster
-              ├── Control Plane (AWS-managed, private endpoint)
-              ├── Node Group: general (m5.large × 2-10)
-              ├── Node Group: memory (r6i.large × 1-5)
-              └── Add-ons: CoreDNS, kube-proxy, VPC CNI, EBS CSI
+VPC
+├── Public Subnets  (NAT Gateways, Load Balancers, Bastion)
+└── Private Subnets (EKS Nodes — NEVER in public subnets)
+       └── EKS Cluster
+             ├── Control Plane (AWS-managed, private API endpoint only)
+             ├── OIDC Provider (enables IRSA)
+             ├── Node Groups
+             │   ├── general   (m5.large × 2-10, for most workloads)
+             │   └── memory    (r6i.large × 1-5, for DB-heavy apps)
+             └── Add-ons (version-pinned)
+                 ├── CoreDNS
+                 ├── kube-proxy
+                 ├── VPC CNI
+                 └── EBS CSI Driver
 ```
 
-## Complete EKS Configuration
-
-```hcl
-module "eks" {
-  source  = "terraform-aws-modules/eks/aws"
-  version = "~> 20.0"
-
-  cluster_name    = "${var.project}-${var.environment}"
-  cluster_version = "1.29"
-
-  # Network
-  vpc_id                   = module.vpc.vpc_id
-  subnet_ids               = module.vpc.private_subnets
-  control_plane_subnet_ids = module.vpc.intra_subnets
-
-  # Security — private endpoint only
-  cluster_endpoint_private_access = true
-  cluster_endpoint_public_access  = false
-
-  # Enable IRSA
-  enable_irsa = true
-
-  # Managed Add-ons (version-pinned)
-  cluster_addons = {
-    coredns = {
-      most_recent = true
-      configuration_values = jsonencode({
-        replicaCount = 2
-        resources = { requests = { cpu = "100m", memory = "128Mi" } }
-      })
-    }
-    kube-proxy    = { most_recent = true }
-    vpc-cni       = { most_recent = true }
-    aws-ebs-csi-driver = { most_recent = true }
-  }
-
-  # Node Groups
-  eks_managed_node_groups = {
-    general = {
-      name           = "general"
-      instance_types = ["m5.large"]
-      min_size       = 2
-      max_size       = 10
-      desired_size   = 3
-      disk_size      = 50
-
-      labels = { role = "general" }
-      taints = {}
-
-      update_config = { max_unavailable_percentage = 25 }
-    }
-    memory = {
-      name           = "memory-optimized"
-      instance_types = ["r6i.large"]
-      min_size       = 1
-      max_size       = 5
-      desired_size   = 2
-      disk_size      = 100
-
-      labels = { role = "memory-intensive" }
-      taints = [{ key = "memory-intensive", value = "true", effect = "NO_SCHEDULE" }]
-    }
-  }
-
-  # Access
-  enable_cluster_creator_admin_permissions = true
-
-  tags = local.common_tags
-}
-```
-
-## Post-Cluster: Configure kubectl
-
-```bash
-aws eks update-kubeconfig \
-  --region us-east-1 \
-  --name my-cluster
-
-kubectl get nodes
-kubectl get pods -A
-```
+---
 
 ## IRSA — IAM Roles for Service Accounts
 
+The most important EKS security concept Terraform engineers must understand.
+
+**Without IRSA:** All pods on a node share the node's IAM instance profile. If any pod is compromised, the attacker gets the full node IAM role.
+
+**With IRSA:** Each pod gets its own IAM role, scoped to only what that service needs. A compromised pod can only access its own permissions.
+
 ```hcl
-module "load_balancer_controller_irsa" {
+# Enable IRSA on the cluster
+module "eks" {
+  enable_irsa = true    # Creates an OIDC provider
+}
+
+# Create a role for a specific application
+module "my_app_irsa" {
   source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
   version = "~> 5.0"
 
-  role_name                              = "load-balancer-controller"
-  attach_load_balancer_controller_policy = true
-
+  role_name = "my-app-s3-readonly"
   oidc_providers = {
-    ex = {
+    main = {
       provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["kube-system:aws-load-balancer-controller"]
+      namespace_service_accounts = ["default:my-app"]    # namespace:serviceaccount
     }
+  }
+}
+
+# Now `my-app` pod gets its own IAM role.
+# Other pods on the same node get nothing from this role.
+```
+
+---
+
+## Security: Private Endpoint Only
+
+```hcl
+module "eks" {
+  cluster_endpoint_private_access = true
+  cluster_endpoint_public_access  = false   # NEVER expose Kubernetes API to internet
+
+  # To access the cluster from your machine:
+  # 1. VPN into the VPC, or
+  # 2. Use a bastion host, or
+  # 3. Use AWS Cloud9/SSM
+}
+```
+
+A public Kubernetes API endpoint is reachable by anyone on the internet. Even with authentication, it's an attack surface. Private-only = only traffic from inside the VPC can reach it.
+
+---
+
+## Node Group Best Practices
+
+```hcl
+eks_managed_node_groups = {
+  general = {
+    instance_types = ["m5.large"]
+    min_size       = 2      # Never less than 2 — one per AZ minimum
+    max_size       = 10     # Cluster autoscaler ceiling
+    desired_size   = 3      # Starting point
+
+    disk_size = 50          # 50 GB per node
+
+    update_config = {
+      max_unavailable_percentage = 25    # Only 25% of nodes update at once
+    }
+
+    labels = { role = "general" }
+    taints = []    # no taints for general workloads
+  }
+
+  memory_optimized = {
+    instance_types = ["r6i.large"]
+    min_size       = 0      # Scale to zero when not needed
+    max_size       = 5
+    desired_size   = 0
+
+    taints = [{
+      key    = "workload-type"
+      value  = "memory-intensive"
+      effect = "NO_SCHEDULE"    # Only pods that tolerate this taint run here
+    }]
   }
 }
 ```
 
 ---
 
-## Audience Levels
+## After Apply: Configure kubectl
 
-### 🟢 Beginner
-EKS = managed Kubernetes. Terraform provisions the entire cluster so you never click in the console. The module (`terraform-aws-modules/eks/aws`) handles 90% of the complexity.
+```bash
+# The output "configure_kubectl" contains this command:
+aws eks update-kubeconfig   --region us-east-1   --name myapp-prod
 
-### 🔵 Intermediate
-Always use private endpoint (`cluster_endpoint_public_access = false`). Access the API server via VPN or bastion host. Never expose the Kubernetes API to the internet.
+# Verify
+kubectl get nodes
+kubectl get pods -A
 
-### 🟠 Advanced
-Node group sizing: start with m5.large × 3 for general workloads. Monitor with CloudWatch Container Insights. Enable Cluster Autoscaler (IRSA role + Helm chart). Add Karpenter for more flexible node provisioning.
-
-### 🔴 Expert
-At 200K+ concurrent sessions: use multiple node groups with different instance types, Spot instances for cost (with on-demand fallback), topology spread constraints for cross-AZ distribution, PodDisruptionBudgets for zero-downtime node drain.
+# Check cluster version
+kubectl version
+```

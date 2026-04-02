@@ -1,99 +1,142 @@
 # Day 18 — Policy as Code: Sentinel & OPA
 
-## WHAT
-Policy as code enforces infrastructure governance rules automatically, blocking non-compliant resources before they are created.
+## Real-Life Example 🏗️
 
-## Why Policy as Code?
-- Manual code review misses security misconfigurations at scale
-- Compliance rules (encryption, tagging, no public exposure) must be enforced consistently
-- Shift-left security: catch violations at plan time, not in production
+**The Compliance Failure:**  
+Your company's security policy: "No S3 bucket may store data without encryption. No RDS instance may be publicly accessible."
+
+Three teams are deploying independently. Code review happens but reviewers are humans — they miss things under pressure. Two months later, a security audit finds:
+- 3 unencrypted S3 buckets in staging
+- 1 publicly accessible RDS instance in prod (created during an incident fix)
+
+**With policy as code:**  
+Every PR is scanned by OPA before merge. Every `terraform apply` in CI/CD is blocked if any policy fails. The audit finds zero violations.
 
 ---
 
-## Option 1: HashiCorp Sentinel (Terraform Cloud/Enterprise)
+## What is Policy as Code?
 
-Sentinel runs as a "soft mandatory" or "hard mandatory" gate between `plan` and `apply`.
+Policy as code is automating the enforcement of infrastructure rules. Instead of hoping reviewers catch violations, you codify the rules and let automation enforce them.
 
-```python
-# policies/enforce-encryption.sentinel
-import "tfplan/v2" as tfplan
-
-# Find all S3 bucket resources
-s3_buckets = filter tfplan.resource_changes as _, changes {
-  changes.type is "aws_s3_bucket" and
-  changes.change.actions contains "create"
-}
-
-# Check each bucket has encryption
-main = rule {
-  all s3_buckets as _, bucket {
-    bucket.change.after.server_side_encryption_configuration is not null
-  }
-}
+```
+terraform plan → generates plan JSON → OPA/Sentinel checks policies → PASS or FAIL
+                                                                              │
+                                                                              └── FAIL = PR is blocked
+                                                                                  apply cannot run
 ```
 
-```hcl
-# sentinel.hcl — policy set configuration
-policy "enforce-encryption" {
-  source            = "./policies/enforce-encryption.sentinel"
-  enforcement_level = "hard-mandatory"  # or "soft-mandatory" (override allowed)
-}
-```
+---
 
-## Option 2: OPA with Conftest (Open Source)
+## Option 1: OPA with Conftest (Open Source — Recommended to Start)
 
-OPA uses Rego policy language. Works with any Terraform plan.
-
+### Writing a Policy in Rego
 ```rego
-# policies/s3-encryption.rego
+# policies/s3-security.rego
 package main
 
+# Deny any S3 bucket without encryption
 deny[msg] {
   resource := input.resource_changes[_]
   resource.type == "aws_s3_bucket"
   resource.change.actions[_] == "create"
   not resource.change.after.server_side_encryption_configuration
-  msg := sprintf("S3 bucket '%v' must have server-side encryption enabled", [resource.address])
+  msg := sprintf(
+    "FAIL: S3 bucket '%v' must have server-side encryption configured",
+    [resource.address]
+  )
 }
 
+# Deny any RDS that is publicly accessible
 deny[msg] {
   resource := input.resource_changes[_]
-  resource.type == "aws_s3_bucket"
-  not resource.change.after.tags.Environment
-  msg := sprintf("Resource '%v' must have an 'Environment' tag", [resource.address])
+  resource.type == "aws_db_instance"
+  resource.change.after.publicly_accessible == true
+  msg := sprintf(
+    "FAIL: RDS instance '%v' must not be publicly accessible",
+    [resource.address]
+  )
+}
+
+# Deny any resource missing required tags
+deny[msg] {
+  resource := input.resource_changes[_]
+  resource.change.actions[_] == "create"
+  required_tags := {"Environment", "Owner", "Project"}
+  missing := required_tags - {t | resource.change.after.tags[t]}
+  count(missing) > 0
+  msg := sprintf(
+    "FAIL: '%v' is missing required tags: %v",
+    [resource.address, missing]
+  )
 }
 ```
 
+### Running in CI/CD
 ```bash
-# In CI/CD pipeline:
+# Generate the plan JSON
 terraform plan -out=tfplan.binary
 terraform show -json tfplan.binary > tfplan.json
+
+# Run policies
 conftest test tfplan.json --policy policies/
+
+# Output on failure:
+# FAIL - tfplan.json - main - FAIL: S3 bucket 'aws_s3_bucket.logs' must have server-side encryption configured
+# FAIL - tfplan.json - main - FAIL: RDS instance 'aws_db_instance.main' must not be publicly accessible
+
+# Output on success:
+# 2 tests, 2 passed, 0 warnings, 0 failures
 ```
 
-## Common Policy Rules
-
-| Rule | Resource | Check |
-|---|---|---|
-| No unencrypted S3 | aws_s3_bucket | server_side_encryption_configuration != null |
-| No public RDS | aws_db_instance | publicly_accessible == false |
-| No open SSH | aws_security_group | No ingress 22 from 0.0.0.0/0 |
-| Required tags | all resources | tags contains Environment, Owner, Project |
-| KMS encryption on RDS | aws_db_instance | storage_encrypted == true |
-| Deletion protection on RDS | aws_db_instance | deletion_protection == true |
+### GitHub Actions Integration
+```yaml
+- name: OPA Policy Check
+  run: |
+    terraform plan -out=tfplan.binary
+    terraform show -json tfplan.binary > tfplan.json
+    conftest test tfplan.json --policy policies/
+```
 
 ---
 
-## Audience Levels
+## Option 2: HashiCorp Sentinel (Terraform Cloud/Enterprise)
 
-### 🟢 Beginner
-Policy as code = automated compliance checks. Instead of hoping reviewers catch "this S3 bucket isn't encrypted", a policy blocks it before it can be applied.
+Sentinel runs between `plan` and `apply`. Hard mandatory policies cannot be overridden.
 
-### 🔵 Intermediate
-Start with `conftest` + OPA — it's free, open source, and integrates with any CI/CD. Write 5 policies for your most common violations. Run on every PR.
+```python
+# sentinel/enforce-encryption.sentinel
+import "tfplan/v2" as tfplan
 
-### 🟠 Advanced
-Build a policy library shared across all teams. Policies are code — version them, test them, review them. Tag policies with compliance framework IDs (SOC2 CC6.1, ISO 27001 A.13.1.1).
+# All S3 buckets must have encryption configured
+s3_encryption = rule {
+  all tfplan.resource_changes as _, changes {
+    changes.type is not "aws_s3_bucket" or
+    changes.change.after.server_side_encryption_configuration is not null
+  }
+}
 
-### 🔴 Expert
-Use Sentinel's import system to check not just the plan but also actual state and external data sources. Build exception workflows: a policy fails but includes an override path with audit trail (GitHub issue approval).
+main = rule { s3_encryption }
+```
+
+```hcl
+# sentinel.hcl
+policy "enforce-encryption" {
+  source            = "./sentinel/enforce-encryption.sentinel"
+  enforcement_level = "hard-mandatory"    # cannot be overridden, period
+}
+```
+
+---
+
+## Policy Library: Rules We Enforce
+
+| Policy | Blocks | Reason |
+|--------|--------|--------|
+| `no-public-rds` | `publicly_accessible = true` | Data exposure |
+| `require-s3-encryption` | S3 without SSE | Data at rest compliance |
+| `require-s3-versioning` | S3 without versioning | Data recovery |
+| `require-tags` | Missing Environment/Owner/Project | Cost attribution + ownership |
+| `no-open-ssh` | Port 22 open to 0.0.0.0/0 | Attack surface |
+| `require-deletion-protection` | RDS without `deletion_protection` | Accidental data loss |
+| `no-public-s3` | S3 with public access | Data exposure |
+| `require-kms-encryption` | Resources not using KMS | Compliance |

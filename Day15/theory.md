@@ -1,175 +1,157 @@
-# Day 15 — Terraform in CI/CD: Jenkins & GitHub Actions
+# Day 15 — Terraform in CI/CD: GitHub Actions & Jenkins
 
-## WHAT
-CI/CD for Terraform automates the plan/apply workflow so no engineer manually applies changes to production.
+## Real-Life Example 🏗️
 
-## The Golden Rule
-**Plan on PR. Apply on merge. Human approval gate in between.**
+**The Manual Apply Problem:**  
+Your team has 6 engineers. Three of them have production AWS access. Anyone can run `terraform apply` from their laptop at any time. This month:
 
-## GitHub Actions Pipeline
+1. Engineer A applies a 2-week-old branch to prod (forgot to pull latest) → two resources recreated → 15-minute outage
+2. Engineer B selects the wrong workspace, applies dev config to staging → wrong VPC CIDR → 2 hours to fix
+3. No audit trail: "Who applied this at 11pm?" No one knows
 
-### Full workflow (.github/workflows/terraform.yml):
-```yaml
-name: Terraform CI/CD
+**The pipeline solution:**  
+- No engineer applies manually to production. Ever.
+- Every change goes: PR → pipeline runs `terraform plan` → plan posted as PR comment → peer review → merge → pipeline applies
+- Full audit trail: every apply is a Git commit with author, timestamp, and the exact plan that was applied
 
-on:
-  pull_request:
-    branches: [main]
-    paths: ["terraform/**"]
-  push:
-    branches: [main]
-    paths: ["terraform/**"]
+---
 
-env:
-  TF_VERSION: "1.6.0"
-  AWS_REGION: "us-east-1"
+## The CI/CD Workflow
 
-jobs:
-  terraform:
-    name: Terraform
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      id-token: write  # For OIDC auth with AWS
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/TerraformCIRole
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
-        working-directory: terraform
-
-      - name: Terraform Init
-        run: terraform init
-        working-directory: terraform
-
-      - name: Terraform Validate
-        run: terraform validate
-        working-directory: terraform
-
-      - name: Terraform Plan
-        id: plan
-        run: terraform plan -no-color -out=tfplan
-        working-directory: terraform
-        continue-on-error: true
-
-      - name: Comment Plan on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const output = `#### Terraform Plan 📋
-            \`\`\`
-            ${{ steps.plan.outputs.stdout }}
-            \`\`\`
-            `;
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: output
-            })
-
-      - name: Terraform Plan Status
-        if: steps.plan.outcome == 'failure'
-        run: exit 1
-
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve tfplan
-        working-directory: terraform
+```
+Developer pushes branch
+         │
+         ▼
+Pull Request opened
+         │
+         ▼
+Pipeline: terraform fmt --check    ← fail if code not formatted
+          terraform validate       ← fail if syntax error
+          terraform plan -out=plan ← preview changes
+          Post plan as PR comment  ← team sees impact
+         │
+         ▼
+Peer review + plan review
+         │
+    Approved?
+    ├── No → request changes
+    └── Yes → merge to main
+               │
+               ▼
+           Pipeline: terraform apply plan
+                        │
+                        ▼
+                     Done. Git commit = audit trail.
 ```
 
-## Jenkins Pipeline (Declarative)
+---
 
+## GitHub Actions — Full Pipeline
+
+See `Day15/code/.github/workflows/terraform.yml` for the complete file. Key concepts:
+
+### OIDC Authentication (No Static Keys)
+```yaml
+permissions:
+  id-token: write   # Required for OIDC
+
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/TerraformCIRole
+    aws-region: us-east-1
+```
+
+GitHub Actions exchanges a short-lived OIDC token for temporary AWS credentials. No `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` stored anywhere. If the credentials leak, they expire in 15 minutes.
+
+### Post Plan as PR Comment
+```yaml
+- name: Comment Plan on PR
+  uses: actions/github-script@v7
+  with:
+    script: |
+      github.rest.issues.createComment({
+        issue_number: context.issue.number,
+        body: "#### Terraform Plan
+```
+" + plan + "
+```"
+      })
+```
+
+Reviewers see the exact resources that will be created/changed/destroyed before they approve.
+
+### Apply Only on Merge to Main
+```yaml
+- name: Terraform Apply
+  if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  run: terraform apply -auto-approve tfplan
+```
+
+`apply` never runs on PRs — only after merge. The plan file from the PR is applied on merge, ensuring what was reviewed is exactly what gets applied.
+
+---
+
+## Jenkins — Jenkinsfile
+
+See `Day15/code/Jenkinsfile` for the complete pipeline. Key concepts:
+
+### Human Approval Gate
 ```groovy
-pipeline {
-    agent any
-    environment {
-        TF_VERSION = "1.6.0"
-        AWS_REGION = "us-east-1"
-    }
-    stages {
-        stage("Checkout") {
-            steps { checkout scm }
-        }
-        stage("Setup") {
-            steps {
-                sh """
-                    wget -q https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip
-                    unzip -o terraform_${TF_VERSION}_linux_amd64.zip
-                    mv terraform /usr/local/bin/
-                """
-            }
-        }
-        stage("Init") {
-            steps {
-                withAWS(role: "TerraformCIRole", region: env.AWS_REGION) {
-                    sh "terraform init"
-                }
-            }
-        }
-        stage("Plan") {
-            steps {
-                withAWS(role: "TerraformCIRole", region: env.AWS_REGION) {
-                    sh "terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt"
-                    archiveArtifacts "tfplan,plan.txt"
-                }
-            }
-        }
-        stage("Approval") {
-            when { branch "main" }
-            steps {
-                input message: "Review plan.txt and approve to apply", ok: "Apply"
-            }
-        }
-        stage("Apply") {
-            when { branch "main" }
-            steps {
-                withAWS(role: "TerraformCIRole", region: env.AWS_REGION) {
-                    sh "terraform apply tfplan"
-                }
-            }
-        }
-    }
-    post {
-        failure { emailext subject: "Terraform Apply Failed", body: "${env.BUILD_URL}", to: "team@company.com" }
-    }
+stage("Human Approval") {
+  when { branch "main" }
+  steps {
+    input message: "Review plan output and approve to apply", ok: "Approve"
+  }
 }
 ```
 
-## Best Practices
+Jenkins pauses and sends a notification. An engineer reviews the plan and explicitly approves before apply runs.
 
-| Practice | Why |
-|---|---|
-| OIDC authentication (no static keys) | Keys can be leaked; OIDC is ephemeral |
-| Post plan as PR comment | Reviewers see impact before approving |
-| `-no-color` flag | Avoids ANSI escape codes in logs |
-| Archive plan file | Ensures apply == reviewed plan |
-| Human approval gate on main | Last line of defence |
-| `terraform fmt -check` | Enforce consistent formatting |
-| Run in PR environment | Catch issues before merge |
+### withAWS Role Assumption
+```groovy
+withAWS(role: "TerraformCIRole", region: "us-east-1") {
+  sh "terraform apply tfplan"
+}
+```
 
-## Audience Levels
+No stored access keys — Jenkins assumes an IAM role per-run.
 
-### 🟢 Beginner
-CI/CD means no one runs `terraform apply` by hand. The pipeline does it. Code review + CI = safety.
+---
 
-### 🔵 Intermediate
-Use OIDC for AWS authentication instead of access keys. GitHub Actions and AWS OIDC integration means no secrets stored in GitHub.
+## Required CI/CD Checklist
 
-### 🟠 Advanced
-Use Atlantis for GitOps Terraform. Atlantis runs as a server, comments `terraform plan` results on PRs, and applies on PR merge — all with full audit logs.
+```yaml
+# Run on every PR:
+✅ terraform fmt -check    # Catches unformatted code
+✅ terraform validate      # Catches syntax/logic errors
+✅ terraform plan -out     # Shows what will change
+✅ Post plan as comment    # Enables informed code review
+✅ checkov / tfsec         # Security scanning (Day 19)
 
-### 🔴 Expert
-Build a promotion pipeline: dev auto-applies on merge, staging requires 1 approval, prod requires 2 approvals + change window check (no applies on Fridays). Use plan output to auto-estimate cost with Infracost in the PR comment.
+# Run on merge to main:
+✅ terraform apply tfplan  # Applies the exact reviewed plan
+✅ terraform output        # Print outputs for reference
+
+# NEVER:
+❌ terraform apply without reviewing plan
+❌ terraform apply -auto-approve in production without a prior human review step
+❌ Hardcoded AWS credentials in pipeline config
+```
+
+---
+
+## Setting Up OIDC (One-Time)
+
+```hcl
+# In your IAM Terraform config (Day 17):
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+}
+```
+
+Add to GitHub repository secrets:
+- `AWS_ACCOUNT_ID` = your 12-digit AWS account number
+
+That's it. No access keys needed.

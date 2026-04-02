@@ -1,46 +1,39 @@
 ################################################################################
-# Day 12 — Environment Management Patterns
-# Pattern 1: Workspaces
+# Day 12 — main.tf
+# Topic: Workspaces vs tfvars for Environment Management
+#
+# Real-life scenario:
+#   You need dev, staging, and prod environments. Do you use workspaces
+#   or separate tfvars files? This config demonstrates BOTH patterns
+#   and explains when to use each.
 ################################################################################
-terraform {
-  required_version = ">= 1.6.0"
-  required_providers {
-    aws = { source = "hashicorp/aws", version = "~> 5.0" }
-  }
-  backend "s3" {
-    bucket         = "my-org-terraform-state"
-    key            = "workspace-demo/terraform.tfstate"
-    region         = "us-east-1"
-    dynamodb_table = "terraform-state-lock"
-    encrypt        = true
-  }
-}
 
-provider "aws" { region = "us-east-1" }
-
-# Workspace-based configuration
 locals {
-  env_config = {
-    default = { instance_type = "t3.micro",  subnet_count = 1, nat_gateway = false }
-    dev     = { instance_type = "t3.micro",  subnet_count = 2, nat_gateway = false }
-    staging = { instance_type = "t3.small",  subnet_count = 2, nat_gateway = true }
-    prod    = { instance_type = "t3.medium", subnet_count = 3, nat_gateway = true }
+  # terraform.workspace = "default" | "dev" | "staging" | "prod"
+  name_prefix = "${var.project}-${terraform.workspace}"
+
+  # Workspace-driven configuration: different infra per workspace
+  workspace_config = {
+    default = { subnet_count = 1, enable_nat = false }
+    dev     = { subnet_count = 1, enable_nat = false }
+    staging = { subnet_count = 2, enable_nat = false }
+    prod    = { subnet_count = 3, enable_nat = true  }
   }
 
-  config = lookup(local.env_config, terraform.workspace, local.env_config["default"])
-
-  common_tags = {
-    Environment = terraform.workspace
-    ManagedBy   = "Terraform"
-    Day         = "Day12"
-  }
+  config = lookup(local.workspace_config, terraform.workspace, local.workspace_config["default"])
 }
 
 resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
-  tags       = merge(local.common_tags, { Name = "day12-${terraform.workspace}-vpc" })
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name      = "${local.name_prefix}-vpc"
+    Workspace = terraform.workspace
+  }
 }
 
-output "workspace"     { value = terraform.workspace }
-output "instance_type" { value = local.config.instance_type }
-output "vpc_id"        { value = aws_vpc.main.id }
+output "current_workspace" { value = terraform.workspace }
+output "vpc_id"            { value = aws_vpc.main.id }
+output "workspace_config"  { value = local.config }

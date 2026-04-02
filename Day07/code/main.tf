@@ -1,65 +1,65 @@
 ################################################################################
-# Day 07 — Functions & Expressions Demo
+# Day 07 — main.tf
+# Topic: HCL Functions & Expressions
+#
+# Real-life scenario:
+#   You need to provision subnets across all AZs in a region — but you
+#   don't know how many AZs exist (it varies by region). Functions let you
+#   compute CIDRs and iterate dynamically rather than hardcoding.
 ################################################################################
-terraform {
-  required_version = ">= 1.6.0"
-  required_providers {
-    aws = { source = "hashicorp/aws", version = "~> 5.0" }
-  }
-}
-
-provider "aws" { region = "us-east-1" }
-
-variable "project"     { type = string; default = "day07" }
-variable "environment" { type = string; default = "dev" }
-variable "vpc_cidr"    { type = string; default = "10.0.0.0/16" }
-variable "subnet_count" { type = number; default = 3 }
-variable "env_list"    { type = list(string); default = ["dev", "staging", "production"] }
 
 locals {
-  # String manipulation
-  name_prefix  = lower(replace("${var.project}-${var.environment}", "_", "-"))
-  project_upper = upper(var.project)
+  # ── String functions ────────────────────────────────────────────────────
+  name_prefix    = lower(replace("${var.project}-${var.environment}", "_", "-"))
+  project_upper  = upper(var.project)
+  padded_name    = format("%-20s", var.project)   # left-align, 20 chars
 
-  # Network calculation using functions
-  subnet_cidrs = [for i in range(var.subnet_count) : cidrsubnet(var.vpc_cidr, 8, i + 1)]
+  # ── Collection functions ─────────────────────────────────────────────────
+  sorted_envs    = sort(var.env_list)                    # ["dev","prod","staging"]
+  unique_envs    = distinct(concat(var.env_list, ["dev"])) # dedup
+  env_count      = length(var.env_list)
 
-  # Conditional
-  is_production   = var.environment == "production"
-  instance_type   = local.is_production ? "t3.large" : "t3.micro"
-  min_az_count    = local.is_production ? 3 : 2
+  # ── Network functions ────────────────────────────────────────────────────
+  # Automatically compute /24 subnets from a /16 VPC
+  # cidrsubnet("10.0.0.0/16", 8, 1) → "10.0.1.0/24"
+  subnet_cidrs   = [for i in range(var.subnet_count) : cidrsubnet(var.vpc_cidr, 8, i + 1)]
 
-  # Collection transformations
-  uppercase_envs  = [for e in var.env_list : upper(e)]
-  env_map         = {for idx, e in var.env_list : e => idx}
-  non_dev_envs    = [for e in var.env_list : e if e != "dev"]
+  # ── For expressions — transform collections ───────────────────────────
+  env_upper_list = [for e in var.env_list : upper(e)]            # ["DEV","STAGING","PROD"]
+  non_prod_envs  = [for e in var.env_list : e if e != "prod"]    # filter
+  resource_names = [for k, v in var.resource_map : "${k}-${v}"]  # map iteration
+  instance_map   = {for k, v in var.resource_map : k => v}       # map → map
 
-  # Common tags using merge
+  # ── Conditional expression ───────────────────────────────────────────────
+  is_production  = var.environment == "prod"
+  instance_type  = local.is_production ? "t3.large" : "t3.micro"
+  log_retention  = local.is_production ? 90 : 7  # days
+
+  # ── Merge function for tags ──────────────────────────────────────────────
   common_tags = merge(
-    { Project = var.project, Environment = var.environment, ManagedBy = "Terraform" },
-    local.is_production ? { CriticalLevel = "high", Backup = "required" } : {}
+    { Project = var.project, Environment = var.environment },
+    local.is_production ? { CriticalLevel = "high", BackupRequired = "true" } : {}
   )
 }
 
 data "aws_availability_zones" "available" { state = "available" }
 
 resource "aws_vpc" "main" {
-  cidr_block = var.vpc_cidr
-  tags       = merge(local.common_tags, { Name = "${local.name_prefix}-vpc" })
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags                 = merge(local.common_tags, { Name = "${local.name_prefix}-vpc" })
 }
 
-resource "aws_subnet" "main" {
+# Create subnets using computed CIDRs — no hardcoding
+resource "aws_subnet" "public" {
   count             = var.subnet_count
   vpc_id            = aws_vpc.main.id
   cidr_block        = local.subnet_cidrs[count.index]
   availability_zone = element(data.aws_availability_zones.available.names, count.index)
-  tags              = merge(local.common_tags, { Name = "${local.name_prefix}-subnet-${count.index + 1}" })
-}
 
-output "computed_name_prefix" { value = local.name_prefix }
-output "subnet_cidrs"         { value = local.subnet_cidrs }
-output "uppercase_environments" { value = local.uppercase_envs }
-output "env_index_map"         { value = local.env_map }
-output "non_dev_environments"  { value = local.non_dev_envs }
-output "instance_type"         { value = local.instance_type }
-output "common_tags"           { value = local.common_tags }
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-subnet-${count.index + 1}"
+    CIDR = local.subnet_cidrs[count.index]
+  })
+}

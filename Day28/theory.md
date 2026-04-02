@@ -1,54 +1,94 @@
-# Day 28 — Terraform Interview Questions (Real Ones)
+# Day 28 — Terraform Interview Questions
+
+## Real-Life Example 🏗️
+
+These are questions I was actually asked in interviews for senior DevOps and platform engineering roles. The answers that worked are included. What distinguishes a good answer from a great one: concrete examples from production experience.
+
+---
 
 ## Foundational Questions
 
-**Q: What is the difference between `terraform plan` and `terraform apply`?**
-A: `plan` shows what Terraform *would* do without making any changes — it diffs desired state (config) vs current state (tfstate + real infra). `apply` executes those changes. Always review plan before apply. In production CI/CD: plan runs on PR, apply runs on merge with human approval.
+**Q: What is Terraform state and why does it matter?**
 
-**Q: Explain Terraform state and why it matters.**
-A: State is a JSON file mapping resource blocks to real cloud objects. Without it, Terraform can't know what exists, what to update, or what to delete. State is the source of truth. In teams: always store remotely (S3), always lock (DynamoDB), always encrypt.
+State is a JSON file that maps your HCL resource blocks to real AWS resource IDs. Terraform uses it to know: what exists (so it doesn't recreate), what changed (so it only updates what's needed), and what to delete (so it can clean up).
+
+Without state: every `apply` would try to create everything from scratch.
+
+In teams: store state remotely (S3), lock it during apply (DynamoDB), encrypt it at rest (KMS), enable versioning (S3 versioning). Local state in a team environment always leads to a corruption incident — usually within 3 months.
+
+**Q: Explain the difference between `terraform plan` and `terraform apply`.**
+
+`plan` is a preview — it calls AWS read-only APIs to diff desired state (code) vs known state (state file) vs real infra, then shows what would change. No writes.
+
+`apply` executes the plan. Makes real API calls. Writes to state.
+
+In production CI/CD: plan runs on PR and is posted as a comment so reviewers see the impact. Apply runs on merge to main, after human review and approval. Never apply without reviewing the plan.
 
 **Q: What is a Terraform provider?**
-A: A plugin that implements CRUD operations for a specific API. The AWS provider translates HCL into AWS API calls. Providers are downloaded by `terraform init` and pinned in `.terraform.lock.hcl`.
+
+A plugin that implements CRUD operations for a specific API. The AWS provider translates your HCL into AWS API calls. Providers are separate binaries downloaded by `terraform init` to `.terraform/providers/`. Version pinned in `.terraform.lock.hcl` (which you commit to Git).
+
+---
 
 ## Intermediate Questions
 
-**Q: How do you manage Terraform state in a team environment?**
-A: Remote backend (S3 for AWS), DynamoDB for state locking, S3 versioning enabled, SSE encryption, IAM-restricted access. Never local state in team environments.
+**Q: `count` vs `for_each` — when do you use each?**
 
-**Q: What is a Terraform module and why use one?**
-A: A module is a directory of Terraform files designed for reuse. Use modules to eliminate duplication, enforce consistency, and enable self-service infrastructure. Treat modules like APIs: version them, document them, test them.
+`count` for simple numbered resources where you won't remove items from the middle. `for_each` for everything else — it uses stable string keys, so removing one item only destroys that resource without affecting others.
 
-**Q: What is the difference between `count` and `for_each`?**
-A: Both create multiple resource instances. `count` uses numeric indices — removing item 0 cascades destruction to all subsequent. `for_each` uses stable string keys — removing one key only destroys that one resource. Prefer `for_each` for almost everything.
+Real-life: I switched a project from `count` to `for_each` after a subnet removal destroyed 3 EC2 instances because their indices shifted. Never used `count` for collections after that.
 
-**Q: How do you handle secrets in Terraform?**
-A: AWS Secrets Manager or HashiCorp Vault data sources. Mark sensitive outputs with `sensitive = true`. Never put secrets in `.tfvars` files committed to Git. Encrypt state at rest.
+**Q: How do you manage state in a team?**
 
-**Q: What happens if two people run `terraform apply` at the same time?**
-A: Without locking: state corruption (both write to state simultaneously). With DynamoDB locking: the second apply blocks until the first finishes.
+S3 backend, DynamoDB locking, S3 versioning, KMS encryption, IAM-restricted access. We also set up a nightly drift detection pipeline that runs `terraform plan -detailed-exitcode` and pages us if exit code 2 (changes detected).
+
+**Q: What's a Terraform module and why use one?**
+
+A directory of `.tf` files designed for reuse — variables.tf (inputs), main.tf (resources), outputs.tf (outputs). No provider block, no backend.
+
+At Amdocs: built a module library for VPC, EKS, RDS, ALB, IAM. Reduced environment provisioning from 48 hours to 30 minutes. Any engineer can now provision from a 40-line root config.
+
+**Q: How do you handle secrets?**
+
+AWS Secrets Manager data sources (`data "aws_secretsmanager_secret_version"`). Mark sensitive outputs with `sensitive = true`. Encrypt state with KMS. `*.tfvars` in `.gitignore`. CI/CD injects secrets via `TF_VAR_x` environment variables, never stored in files.
+
+---
 
 ## Advanced Questions
 
-**Q: What is `terraform import` and when would you use it?**
-A: Brings existing resources into Terraform state without recreating them. Used when inheriting manually-created infrastructure, recovering from state corruption, or migrating from another IaC tool. Terraform 1.5+ adds declarative `import {}` blocks and `-generate-config-out` flag.
+**Q: What is `terraform import` and when do you use it?**
 
-**Q: How do you test Terraform code?**
-A: Layered approach: `terraform validate` (syntax), `terraform plan` (logic), `checkov`/`tfsec` (security scanning), Terratest (integration tests that deploy and validate real infra), Infracost (cost validation).
+Brings existing infrastructure into Terraform state without recreating it. Used when adopting manually-created resources or recovering from state corruption.
 
-**Q: What is IRSA and why is it better than node instance profiles for EKS?**
-A: IRSA (IAM Roles for Service Accounts) binds IAM roles to Kubernetes service accounts via OIDC. Each pod gets exactly the permissions it needs. With instance profiles, all pods on a node share the same IAM role — violating least privilege.
+Terraform 1.5+ added declarative `import {}` blocks: define the import in code, run `terraform plan -generate-config-out=generated.tf`, and Terraform writes the resource config for you.
 
-**Q: How would you handle a Terraform state corruption incident?**
-A: 1) Stop all applies immediately, 2) Check S3 versioning for a recent good state, 3) Restore the state, 4) Run `terraform plan` to verify accuracy, 5) For partial corruption: use `terraform state rm` / `terraform import` to fix individual resources, 6) Post-incident: ensure DynamoDB locking was enabled.
+**Q: Two people run `terraform apply` simultaneously. What happens?**
+
+Without DynamoDB locking: both read the same state version, both apply, one overwrites the other's state. State corruption. Potentially missing or duplicate resources.
+
+With locking: the second apply sees the DynamoDB lock item, waits or fails with "state is locked by [engineer] since [time]". Apply safely serialised.
+
+**Q: What is IRSA and why is it better than EC2 instance profiles for EKS?**
+
+IRSA (IAM Roles for Service Accounts) binds an IAM role to a specific Kubernetes service account. Each pod gets its own scoped role. With instance profiles, all pods on a node share the same IAM role — violating least privilege. A compromised pod gets full node-level AWS access.
+
+---
 
 ## Expert Questions
 
-**Q: Explain the Terraform provider plugin protocol.**
-A: Providers communicate with the Terraform core via gRPC (Plugin Protocol v5/v6). The provider binary implements: `GetSchema`, `PlanResourceChange`, `ApplyResourceChange`, `ImportResourceState`. The core calls these via the plugin protocol. Plugin Framework (successor to SDKv2) uses Protocol v6.
+**Q: Explain the Terraform dependency graph.**
 
-**Q: How does Terraform build its execution plan?**
-A: Builds a DAG (Directed Acyclic Graph) from resource references. Walks the graph calling `provider.ReadResource` for each existing resource (refresh). Diffs desired vs refreshed state. Produces an ordered execution plan respecting dependencies. Independent resources are created in parallel (up to `-parallelism=N`).
+Terraform builds a DAG (Directed Acyclic Graph) from resource references. `aws_subnet.main` references `aws_vpc.main.id` → creates VPC before subnet. Independent resources run in parallel (up to `-parallelism=N`, default 10). `terraform graph | dot -Tsvg > graph.svg` visualises it.
 
-**Q: What is the `.terraform.lock.hcl` file?**
-A: Lockfile recording exact provider versions and checksums after `terraform init`. Commit this to Git — it ensures all team members and CI/CD use identical provider versions regardless of constraint expressions in config.
+**Q: What is `.terraform.lock.hcl` and should you commit it?**
+
+Records exact provider versions (not just constraints) and checksums after `terraform init`. YES, commit it. It ensures every engineer and every CI/CD runner uses identical provider binaries regardless of when they run init. Without it: "works on my machine" with different provider behaviour.
+
+**Q: How do you test Terraform code?**
+
+Three layers:
+1. `terraform validate` + `checkov`/`tfsec` — syntax and security (seconds, free)
+2. `terraform plan` — logic check in CI on every PR (30 seconds, free)
+3. Terratest — integration test that deploys real infra, validates outputs, destroys (5-20 minutes, ~$0.10/run)
+
+All three. Never skip any layer.

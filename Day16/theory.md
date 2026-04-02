@@ -1,55 +1,79 @@
 # Day 16 — Securing Secrets with Vault & AWS Secrets Manager
 
-## 5W + 1H
+## Real-Life Example 🏗️
 
-### WHAT
-Secrets management means keeping sensitive values (passwords, API keys, private keys) out of code, state files, and CI/CD logs — while still making them available to Terraform at apply time.
+**The Git History Problem:**  
+A developer adds this to `terraform.tfvars`:
+```hcl
+db_password = "MyProdDB-2024-SecurePass!"
+```
 
-### WHY IT MATTERS
-- Secrets in Git = permanent exposure (commit history never forgets)
-- Secrets in `.tfvars` = accidental commit risk
-- Secrets in plain state = anyone with S3 access can read them
+Commits it. The file is in `.gitignore` so it never shows in the repo... or so they think.  
+A new engineer clones the repo and runs `git log --all --full-history -- terraform.tfvars`.  
+The file appears in history. The password is visible. It has been there for 4 months.
+
+The password must now be rotated across all environments that share it.  
+**Total impact: 3 hours of rotation work, 15 minutes of planned downtime.**
+
+**The correct approach:** secrets never touch the filesystem. They're fetched at apply time from a secrets manager.
 
 ---
 
-## Option 1: AWS Secrets Manager
+## Why Not Store Secrets in Code or tfvars?
+
+| Location | Problem |
+|----------|---------|
+| `main.tf` | In Git forever, visible to anyone with repo access |
+| `terraform.tfvars` | Easy to accidentally commit; stays in git history even after deletion |
+| Terraform state | State IS encrypted (if you set up KMS) but still — minimize exposure |
+| CI/CD environment variables | Better — but prefer fetching from a secrets manager at runtime |
+
+---
+
+## AWS Secrets Manager Pattern
 
 ```hcl
-# Store the secret in AWS Secrets Manager first:
-# aws secretsmanager create-secret --name prod/database/password --secret-string "mySecurePass123"
+# Step 1: Create the secret in Terraform (or manually in AWS console)
+resource "aws_secretsmanager_secret" "db_password" {
+  name                    = "prod/database/master-password"
+  description             = "RDS master password for prod"
+  recovery_window_in_days = 7    # 7-day grace period before permanent deletion
+}
 
+# Step 2: Store the secret value (use random_password to generate it)
+resource "random_password" "db" {
+  length  = 32
+  special = true
+}
+
+resource "aws_secretsmanager_secret_version" "db_password" {
+  secret_id     = aws_secretsmanager_secret.db_password.id
+  secret_string = random_password.db.result
+}
+
+# Step 3: Read it back in the same config (or in a different stack)
 data "aws_secretsmanager_secret_version" "db_password" {
-  secret_id = "prod/database/password"
+  secret_id = aws_secretsmanager_secret.db_password.id
+  depends_on = [aws_secretsmanager_secret_version.db_password]
 }
 
+# Step 4: Use it — the password never appears in any .tf file
 resource "aws_db_instance" "main" {
-  identifier        = "prod-db"
-  engine            = "postgres"
-  instance_class    = "db.t3.medium"
-  allocated_storage = 20
-  username          = "dbadmin"
-  password          = data.aws_secretsmanager_secret_version.db_password.secret_string
-  skip_final_snapshot = true
+  password = data.aws_secretsmanager_secret_version.db_password.secret_string
+  # ↑ Fetched at apply time. Not stored in code. Encrypted in state.
 }
 ```
 
-Secret rotation with Terraform:
-```hcl
-resource "aws_secretsmanager_secret_rotation" "db_password" {
-  secret_id           = aws_secretsmanager_secret.db_password.id
-  rotation_lambda_arn = aws_lambda_function.rotate_secret.arn
-  rotation_rules {
-    automatically_after_days = 30
-  }
-}
-```
+---
 
-## Option 2: HashiCorp Vault
+## HashiCorp Vault Pattern
+
+Vault goes further: it can generate **dynamic credentials** that expire automatically.
 
 ```hcl
 provider "vault" {
   address = "https://vault.internal.company.com"
-  # Auth via: VAULT_TOKEN env var, or AWS auth, or OIDC
+  # Auth: VAULT_TOKEN env var, AWS IAM auth, or OIDC
 }
 
 # Static secret
@@ -57,11 +81,12 @@ data "vault_generic_secret" "db" {
   path = "secret/prod/database"
 }
 
-# Dynamic secret (Vault generates short-lived credentials)
-data "vault_aws_access_credentials" "deploy" {
+# Dynamic AWS credentials (Vault generates fresh keys per apply)
+data "vault_aws_access_credentials" "terraform" {
   backend = "aws"
-  role    = "terraform-deploy"
-  # Returns fresh, short-lived AWS creds for this apply
+  role    = "terraform-execution-role"
+  # Vault calls AWS STS, returns short-lived access keys
+  # Keys expire in 1 hour — leaked credentials auto-expire
 }
 
 resource "aws_db_instance" "main" {
@@ -69,54 +94,53 @@ resource "aws_db_instance" "main" {
 }
 ```
 
-## Rules for Secret Hygiene
+---
+
+## Sensitive Variables and Outputs
 
 ```hcl
-# 1. Mark outputs sensitive
-output "db_password" {
-  value     = aws_db_instance.main.password
-  sensitive = true   # Redacted in plan/apply output
-}
-
-# 2. Never put secrets in variable defaults
+# Mark a variable as sensitive — value is redacted in plan output and logs
 variable "db_password" {
-  type      = string
-  sensitive = true
-  # NO default = "..." here — inject via TF_VAR_db_password env var
+  description = "Database password. Inject via TF_VAR_db_password."
+  type        = string
+  sensitive   = true
 }
 
-# 3. Encrypt state
-terraform {
-  backend "s3" {
-    encrypt        = true
-    kms_key_id     = "arn:aws:kms:us-east-1:...:key/..."
-  }
+# Mark an output as sensitive — shown as <sensitive> in apply output
+output "db_connection_string" {
+  description = "Full database connection string"
+  value       = "postgres://${var.db_user}:${var.db_password}@${aws_db_instance.main.endpoint}/mydb"
+  sensitive   = true
 }
-```
 
-## .gitignore for Terraform projects
-```
-.terraform/
-terraform.tfstate
-terraform.tfstate.backup
-*.tfvars          # Any file with actual values
-!*.tfvars.example # But keep example templates
-.terraform.tfstate.lock.info
-crash.log
+# To read a sensitive output:
+terraform output -raw db_connection_string    # writes raw value to stdout
+terraform output -json | jq .db_connection_string.value  # JSON, unredacted
 ```
 
 ---
 
-## Audience Levels
+## CI/CD: Injecting Secrets Without Storing Them
 
-### 🟢 Beginner
-Never type a password directly into a `.tf` file or `.tfvars`. Use AWS Secrets Manager to store it and `data "aws_secretsmanager_secret_version"` to fetch it.
+```bash
+# In GitHub Actions secrets: store AWS credentials or Vault token
+# At pipeline runtime, fetch and inject:
 
-### 🔵 Intermediate
-Use IAM roles for Terraform's own AWS credentials — never static access keys. CI/CD tools should assume an IAM role via OIDC, not use stored secrets.
+export TF_VAR_db_password=$(aws secretsmanager get-secret-value   --secret-id prod/database/master-password   --query SecretString   --output text)
 
-### 🟠 Advanced
-Vault dynamic secrets: instead of a long-lived DB password, Vault generates a fresh username/password pair for each Terraform apply. Validity: 1 hour. If leaked, it expires automatically.
+terraform apply    # picks up TF_VAR_db_password automatically
+```
 
-### 🔴 Expert
-Build a Vault policy that only allows Terraform to read the specific paths it needs. Audit every secret access via Vault audit log → CloudWatch. Use Vault's AppRole auth for CI/CD instead of token-based auth.
+---
+
+## Security Checklist for Secrets
+
+```
+✅ encrypt = true on S3 backend (state may contain secret values)
+✅ sensitive = true on any variable or output containing secrets
+✅ *.tfvars in .gitignore (never commit real values)
+✅ terraform.tfvars.example in Git (document the shape, no real values)
+✅ Never default = "password" on sensitive variables
+✅ Use data sources, not hardcoded values
+✅ Rotate secrets regularly (Secrets Manager can automate this)
+```

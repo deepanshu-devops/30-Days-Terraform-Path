@@ -1,49 +1,59 @@
 # Day 09 — State Corruption: Causes & Prevention
 
-## WHAT
-State corruption occurs when the `.tfstate` file contains incorrect, conflicting, or truncated data that no longer accurately reflects real infrastructure.
+## Real-Life Example 🏗️
 
-## Causes of State Corruption
+**Monday morning. Production deployment.** Two engineers run `terraform apply` at the same time (state locking was not yet configured on this project).
 
-### 1. Concurrent Apply (Most Common)
-Two engineers run `terraform apply` simultaneously without locking. Both read the same state version, both write back — one overwrites the other.
+Both read the same state version. Both start making changes. Engineer A finishes and writes new state. Engineer B finishes seconds later and overwrites Engineer A's state with a version that doesn't include A's changes.
 
-### 2. Interrupted Apply
-Ctrl+C during apply, network failure, or CI/CD timeout mid-apply. Partial changes written, state may not reflect reality.
+Result: Terraform's state says resources exist that don't, and doesn't know about resources that do.
 
-### 3. Manual State Editing
-Editing `.tfstate` JSON directly. Even a trailing comma breaks JSON parsing.
+Running `terraform plan` now shows:
+- Destroy the live RDS instance (Terraform thinks it shouldn't exist)
+- Create a new RDS instance (Terraform thinks the old one is gone)
 
-### 4. Provider Bugs
-A provider version bug causes incorrect attribute values to be written to state.
+If anyone had run `apply` without checking: the production database would have been destroyed.
 
-### 5. Migration Errors
-Incorrectly migrating state between backends or renaming resources without using `terraform state mv`.
+**Recovery: 4 hours. Prevention: DynamoDB locking + S3 versioning. Setup time: 10 minutes.**
 
 ---
 
-## Signs of State Corruption
+## What Causes State Corruption
+
+| Cause | How It Happens | Prevention |
+|-------|---------------|-----------|
+| Concurrent apply | Two people apply simultaneously | DynamoDB locking |
+| Interrupted apply | Ctrl+C or network failure mid-apply | DynamoDB locking (partial lock remains) |
+| Manual JSON editing | Someone edits `.tfstate` directly | Use `terraform state` commands instead |
+| Provider bug | Buggy version writes wrong attributes | Pin provider versions |
+| Wrong migration | Moving state between backends incorrectly | Use `terraform init -migrate-state` |
+| Deleted state file | State file lost or accidentally deleted | S3 versioning, `prevent_destroy` on bucket |
+
+---
+
+## How to Detect Corruption
 
 ```bash
-# These symptoms indicate potential corruption:
-
-# 1. Resources shown as needing recreation that clearly exist
+# Sign 1: Plan shows destroying healthy resources
 terraform plan
-# - destroy aws_rds_cluster.main
+# - destroy aws_rds_cluster.main   ← RDS is running fine!
 # + create  aws_rds_cluster.main
-# (RDS cluster is running and healthy)
 
-# 2. Error acquiring state lock (stuck lock from a crash)
+# Sign 2: Duplicate entries in state
+terraform state list
+# aws_vpc.main
+# aws_vpc.main   ← two entries for the same resource = corrupted
+
+# Sign 3: JSON parse failure
+terraform plan
+# Error: Failed to load state: At 2:1: unexpected character
+
+# Sign 4: Stuck lock from a previous crash
 terraform plan
 # Error: Error acquiring the state lock
 # Lock Info:
-#   ID:        deadlocked-uuid
-#   Operation: OperationTypeApply
-#   Created:   2024-01-01T12:00:00Z
-
-# 3. Error parsing state
-terraform plan
-# Error: Failed to load state: JSON parsing error
+#   ID:      abc-123-def
+#   Created: 2024-01-15 09:32:00 UTC
 ```
 
 ---
@@ -51,80 +61,89 @@ terraform plan
 ## Prevention Checklist
 
 ```hcl
-# 1. Remote state with locking — Day 08
+# ✅ 1. Remote state with DynamoDB locking (Day 08)
 terraform {
   backend "s3" {
-    bucket         = "my-state-bucket"
-    key            = "prod/terraform.tfstate"
+    bucket         = "my-org-terraform-state"
     dynamodb_table = "terraform-state-lock"
     encrypt        = true
-    region         = "us-east-1"
   }
 }
-```
 
-```bash
-# 2. Enable S3 versioning on state bucket
-aws s3api put-bucket-versioning   --bucket my-state-bucket   --versioning-configuration Status=Enabled
+# ✅ 2. S3 versioning (roll back to previous good state)
+resource "aws_s3_bucket_versioning" "state" {
+  versioning_configuration { status = "Enabled" }
+}
 
-# 3. Never manually edit state — use commands
-terraform state mv  # rename
-terraform state rm  # remove
-terraform import    # bring existing into state
+# ✅ 3. Prevent accidental destroy on critical resources
+resource "aws_db_instance" "prod" {
+  lifecycle { prevent_destroy = true }
+}
 
-# 4. Backup before risky operations
-aws s3 cp s3://my-state-bucket/prod/terraform.tfstate ./backup-$(date +%Y%m%d).tfstate
+resource "aws_s3_bucket" "terraform_state" {
+  lifecycle { prevent_destroy = true }
+}
 
-# 5. Lock before cross-team operations
-terraform force-unlock LOCK_ID  # Only after confirming no apply is running
+# ✅ 4. Never manually edit state — use these commands:
+# terraform state mv    (rename resource)
+# terraform state rm    (remove from tracking — real infra stays)
+# terraform import      (bring existing infra in)
 ```
 
 ---
 
 ## Recovery Procedures
 
-### Scenario 1: Stuck lock
+### Scenario 1: Stuck Lock (Terraform crashed mid-apply)
 ```bash
-terraform force-unlock <LOCK_ID>
-# Only use if you're 100% sure no apply is running
+# Always check: is anyone actually running apply right now?
+aws dynamodb get-item   --table-name terraform-state-lock   --key '{"LockID": {"S": "bucket/path/terraform.tfstate"}}'
+# Read the "Who" and "Created" fields
+
+# Only unlock if you're certain no apply is running:
+terraform force-unlock <LOCK-ID>
 ```
 
-### Scenario 2: Resources shown as needing recreation
+### Scenario 2: Resources Shown Needing Recreation (shouldn't exist)
 ```bash
-# Import the existing resources back
-terraform import aws_db_instance.main my-rds-instance-identifier
-terraform import aws_vpc.main vpc-0abc12345
+# Import the existing resources back into state
+terraform import aws_vpc.main vpc-0abc123456
+terraform import aws_db_instance.main my-rds-identifier
+terraform import aws_eks_cluster.main my-cluster-name
+
+# Verify — plan should show "No changes"
+terraform plan
 ```
 
-### Scenario 3: State has extra resources not in config
+### Scenario 3: Restore from S3 Version
 ```bash
-# Remove from state (does not delete real infrastructure)
-terraform state rm aws_instance.orphan
+# List available state versions
+aws s3api list-object-versions   --bucket my-org-terraform-state   --prefix prod/vpc/terraform.tfstate   --query "Versions[*].{VersionId:VersionId,LastModified:LastModified}"
+
+# Restore the last known-good version
+aws s3api copy-object   --bucket my-org-terraform-state   --copy-source my-org-terraform-state/prod/vpc/terraform.tfstate?versionId=<VERSION_ID>   --key prod/vpc/terraform.tfstate
+
+# Verify
+terraform plan    # should now show correct state
 ```
 
-### Scenario 4: Full state corruption — restore from S3 version
+### Scenario 4: Orphaned Resources (in state but not in config)
 ```bash
-# List versions
-aws s3api list-object-versions   --bucket my-state-bucket   --prefix prod/terraform.tfstate   --query "Versions[*].{VersionId:VersionId,LastModified:LastModified}"
-
-# Restore specific version
-aws s3api get-object   --bucket my-state-bucket   --key prod/terraform.tfstate   --version-id <VERSION_ID>   ./restored.tfstate
-
-aws s3 cp ./restored.tfstate s3://my-state-bucket/prod/terraform.tfstate
+# Remove from state — real infrastructure is untouched
+terraform state rm aws_instance.old_orphan
+terraform state rm module.legacy.aws_vpc.old
 ```
 
 ---
 
-## Audience Levels
+## Safe State Operations Reference
 
-### 🟢 Beginner
-Think of state corruption like a corrupted save file in a video game. The game doesn't know what level you're on. Prevention: save often (S3 versioning), lock your save file (DynamoDB).
-
-### 🔵 Intermediate
-Always use `terraform state` commands, never hand-edit JSON. Use S3 versioning + DynamoDB. Run `terraform plan -refresh=false` to see if state parsing itself works.
-
-### 🟠 Advanced
-Build a runbook for your team covering: stuck lock procedure, how to restore from S3 version, who to notify. Make it a wiki page, not tribal knowledge.
-
-### 🔴 Expert
-For zero-downtime state recovery, use `terraform plan -target=resource.name` to isolate and fix individual corrupted resources without touching the whole state. For large states, use `terraform state pull > state.json` and `terraform state push state.json` to manipulate state programmatically.
+```bash
+terraform state list                           # list all tracked resources
+terraform state show aws_vpc.main              # full details for one resource
+terraform state mv aws_vpc.old aws_vpc.main    # rename without destroy/recreate
+terraform state rm aws_s3_bucket.temp          # remove tracking (infra stays)
+terraform state pull > backup-$(date +%Y%m%d).tfstate  # download state locally
+terraform import aws_vpc.main vpc-0abc123      # bring existing infra into state
+terraform refresh                              # sync state with real infra (careful!)
+```

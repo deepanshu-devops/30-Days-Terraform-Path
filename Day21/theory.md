@@ -1,75 +1,99 @@
 # Day 21 — Managing Multi-Account AWS with Terraform
 
-## WHAT
-Production-grade AWS setups use multiple accounts for isolation:
-- Management account (billing, org-level controls)
-- Security account (logging, audit, GuardDuty)
-- Shared services account (networking, CI/CD)
-- Dev account
-- Staging account
-- Production account(s)
+## Real-Life Example 🏗️
 
-## AWS Organizations + Terraform
+**The Single-Account Blast Radius Problem:**  
+Everything in one AWS account: dev, staging, prod, CI/CD tools, log buckets.
+
+A new engineer is working on dev and runs `terraform destroy` to clean up their test resources. They're in the right directory but the wrong workspace. Prod state is selected. The destroy removes prod resources.
+
+Even with `prevent_destroy`, the blast radius — the scope of what can be accidentally affected — is huge when everything shares one account.
+
+**With multi-account:**  
+Dev, staging, and prod are completely separate AWS accounts with separate credentials and separate Terraform states. An error in the dev account cannot affect prod. Period.
+
+---
+
+## AWS Multi-Account Architecture
+
+```
+Root Management Account
+└── AWS Organizations
+    ├── Security OU
+    │   └── Security Account
+    │       (CloudTrail, GuardDuty, Security Hub for all accounts)
+    ├── Infrastructure OU
+    │   └── Shared Services Account
+    │       (networking, container registry, CI/CD tools)
+    └── Workloads OU
+        ├── Dev Account         (wide permissions, low risk)
+        ├── Staging Account     (production-like, controlled)
+        └── Prod Account        (narrow permissions, MFA, alerts on every change)
+```
+
+---
+
+## Multi-Provider for Multi-Account in Terraform
 
 ```hcl
+# provider.tf — one provider alias per account
 provider "aws" {
-  alias  = "management"
-  region = "us-east-1"
-  # Uses management account credentials
+  alias  = "dev"
+  region = var.aws_region
+
+  assume_role {
+    role_arn     = "arn:aws:iam::${var.dev_account_id}:role/OrganizationAccountAccessRole"
+    session_name = "terraform-dev-${formatdate("YYYYMMDD-hhmm", timestamp())}"
+  }
 }
 
 provider "aws" {
-  alias  = "dev"
-  region = "us-east-1"
+  alias  = "staging"
+  region = var.aws_region
+
   assume_role {
-    role_arn = "arn:aws:iam::DEV_ACCOUNT_ID:role/OrganizationAccountAccessRole"
+    role_arn     = "arn:aws:iam::${var.staging_account_id}:role/OrganizationAccountAccessRole"
+    session_name = "terraform-staging"
   }
 }
 
 provider "aws" {
   alias  = "prod"
-  region = "us-east-1"
+  region = var.aws_region
+
   assume_role {
-    role_arn     = "arn:aws:iam::PROD_ACCOUNT_ID:role/OrganizationAccountAccessRole"
-    session_name = "terraform-prod-apply"
-    external_id  = var.external_id  # Extra security for cross-account
+    role_arn     = "arn:aws:iam::${var.prod_account_id}:role/OrganizationAccountAccessRole"
+    session_name = "terraform-prod"
+    # extra security: require MFA for prod role assumption
+    # external_id = var.prod_external_id
   }
 }
 ```
 
-## Account Factory Pattern
-
 ```hcl
-# Creates new AWS accounts via Organizations
-resource "aws_organizations_account" "dev" {
-  name      = "myorg-dev"
-  email     = "aws-dev@mycompany.com"
-  role_name = "OrganizationAccountAccessRole"
-  parent_id = aws_organizations_organizational_unit.workloads.id
-
-  lifecycle {
-    # Closing an account is a 90-day process — prevent accidental deletion
-    prevent_destroy = true
-  }
+# main.tf — resources go to specific accounts
+resource "aws_vpc" "dev" {
+  provider   = aws.dev
+  cidr_block = "10.0.0.0/16"
+  tags       = { Name = "dev-vpc" }
 }
 
-resource "aws_organizations_account" "prod" {
-  name      = "myorg-prod"
-  email     = "aws-prod@mycompany.com"
-  role_name = "OrganizationAccountAccessRole"
-  parent_id = aws_organizations_organizational_unit.workloads.id
-
-  lifecycle { prevent_destroy = true }
+resource "aws_vpc" "prod" {
+  provider   = aws.prod
+  cidr_block = "10.1.0.0/16"
+  tags       = { Name = "prod-vpc" }
 }
 ```
 
-## Service Control Policies (SCPs)
+---
+
+## Service Control Policies — Org-Level Guardrails
 
 ```hcl
-resource "aws_organizations_policy" "deny_root_actions" {
-  name        = "DenyRootActions"
-  description = "Prevent root account actions across all member accounts"
-  type        = "SERVICE_CONTROL_POLICY"
+# Prevent root account actions across all member accounts
+resource "aws_organizations_policy" "deny_root" {
+  name = "DenyRootActions"
+  type = "SERVICE_CONTROL_POLICY"
 
   content = jsonencode({
     Version = "2012-10-17"
@@ -84,52 +108,44 @@ resource "aws_organizations_policy" "deny_root_actions" {
   })
 }
 
-resource "aws_organizations_policy" "deny_regions" {
-  name = "DenyUnapprovedRegions"
+# Restrict all accounts to approved regions only
+resource "aws_organizations_policy" "approved_regions" {
+  name = "ApprovedRegionsOnly"
   type = "SERVICE_CONTROL_POLICY"
 
   content = jsonencode({
-    Version = "2012-10-17"
     Statement = [{
-      Sid       = "DenyAllOutsideApprovedRegions"
       Effect    = "Deny"
       NotAction = ["iam:*", "sts:*", "support:*"]
       Resource  = ["*"]
       Condition = {
-        StringNotEquals = { "aws:RequestedRegion" = ["us-east-1", "eu-west-1"] }
+        StringNotEquals = {
+          "aws:RequestedRegion" = ["us-east-1", "eu-west-1"]
+        }
       }
     }]
   })
 }
 ```
 
+---
+
 ## Cross-Account State References
 
 ```hcl
-# Prod account reads shared networking state
+# Prod EKS reads networking outputs from Shared Services account
 data "terraform_remote_state" "shared_network" {
   backend = "s3"
-  config = {
-    bucket   = "org-terraform-state-shared"
-    key      = "shared/network/terraform.tfstate"
+  config  = {
+    bucket   = "shared-services-terraform-state"
+    key      = "networking/terraform.tfstate"
     region   = "us-east-1"
-    role_arn = "arn:aws:iam::SHARED_ACCOUNT:role/StateReadOnlyRole"
+    role_arn = "arn:aws:iam::SHARED_SERVICES_ACCOUNT:role/StateReadOnlyRole"
   }
 }
+
+module "eks" {
+  vpc_id     = data.terraform_remote_state.shared_network.outputs.vpc_id
+  subnet_ids = data.terraform_remote_state.shared_network.outputs.private_subnet_ids
+}
 ```
-
----
-
-## Audience Levels
-
-### 🟢 Beginner
-Multi-account = blast radius reduction. If someone compromises dev, they can't touch prod. Keep it simple: start with 2-3 accounts (management, dev, prod).
-
-### 🔵 Intermediate
-Use `assume_role` in provider configurations to access member accounts from one Terraform config. Use AWS SSO (IAM Identity Center) for human access instead of IAM users in each account.
-
-### 🟠 Advanced
-AWS Control Tower automates account vending. Terraform can manage the OUs, SCPs, and baseline resources post-vending. Use Terragrunt for DRY multi-account configurations.
-
-### 🔴 Expert
-Build an Account Vending Machine: a Terraform + Lambda pipeline that creates new accounts, applies baseline SCPs, enables GuardDuty, enables Security Hub, creates the Terraform execution role, and sends a welcome email — all automated.

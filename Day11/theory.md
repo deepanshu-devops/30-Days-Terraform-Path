@@ -1,81 +1,163 @@
 # Day 11 — Module Versioning Best Practices
 
-## WHAT
-Module versioning ensures changes to shared modules don't unexpectedly break environments that depend on them.
+## Real-Life Example 🏗️
+
+**The unversioned module disaster:**  
+Your team has a shared VPC module used across 8 projects. No version pins — every project sources from `main` branch.
+
+A new engineer adds a helpful feature: renames `subnet_count` to `public_subnet_count` and `private_subnet_count`. They merge to main.
+
+Next day: 8 CI/CD pipelines fail with "An argument named subnet_count is not expected here."
+
+All 8 teams need to update their calling code simultaneously. 3 hours of coordinated work.
+
+**With version pinning:** The module change gets tagged `v2.0.0`. Each team upgrades when they're ready. No forced simultaneous updates. No emergency coordination.
+
+---
 
 ## Version Sources
 
-### Git Tags (Most Common)
+### Git Tags — For Internal/Private Modules
 ```hcl
 module "vpc" {
   source = "git::https://github.com/org/terraform-modules.git//vpc?ref=v1.2.0"
+  # The //vpc part = subdirectory inside the repo
+  # ?ref=v1.2.0 = exact git tag
 }
 ```
 
-### Terraform Registry
+```bash
+# How to tag a module release:
+git add modules/vpc/
+git commit -m "feat(vpc): add support for IPv6"
+git tag v1.3.0
+git push origin v1.3.0
+```
+
+### Terraform Registry — For Community/Public Modules
 ```hcl
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
-  version = "~> 5.0"
+  version = "5.5.3"    # Required for registry modules — must specify version
 }
 ```
 
-### Local Paths (Development Only)
+### Local Path — Development Only
 ```hcl
 module "vpc" {
-  source = "../../modules/vpc"  # Never in production
+  source = "../../modules/vpc"    # Relative path
 }
+# NEVER use local paths in production — no version control, no reproducibility
 ```
 
-## Semantic Versioning
-
-```
-MAJOR.MINOR.PATCH
-v1.2.3
-│  │  └── Patch: bug fixes, no API changes
-│  └───── Minor: new features, backward compatible
-└──────── Major: breaking changes (variable renamed, resource type changed)
-```
-
-## Release Workflow
-
-```bash
-# 1. Make changes to module
-git add modules/vpc/
-git commit -m "feat(vpc): add flow logs support"
-
-# 2. Tag the release
-git tag v1.3.0
-git push origin v1.3.0
-
-# 3. Update CHANGELOG
-echo "## v1.3.0 - Add VPC flow logs support" >> CHANGELOG.md
-
-# 4. Test in dev environment first
-# modules/vpc/dev test: version = "v1.3.0"
-
-# 5. Roll out to staging, then production
-```
+---
 
 ## Version Constraint Operators
 
-```hcl
-version = "= 1.2.0"   # Exactly this version (strict)
-version = ">= 1.2.0"  # At least 1.2.0
-version = "~> 1.2"    # >= 1.2, < 2.0 (recommended for modules)
-version = "~> 1.2.0"  # >= 1.2.0, < 1.3.0 (stricter)
+| Constraint | Meaning | Use In |
+|------------|---------|--------|
+| `= 5.5.3` | Exactly 5.5.3 | Production (maximum reproducibility) |
+| `~> 5.5.3` | >= 5.5.3 AND < 5.6.0 (patch updates only) | Conservative production |
+| `~> 5.5` | >= 5.5 AND < 6.0 (minor + patch) | Staging |
+| `>= 5.0` | Any 5.x or higher | Development only |
+
+**Production recommendation: use `= X.Y.Z` (exact) or `~> X.Y.Z` (patch only).**
+
+Never use `~> X` (major version) or no version at all in production.
+
+---
+
+## Semantic Versioning for Modules
+
+```
+v MAJOR . MINOR . PATCH
+v   2   .   1   .   3
+
+PATCH (2.1.3 → 2.1.4): Bug fix, no API changes
+  Example: Fix a race condition in security group creation
+  Safe to auto-upgrade with ~> 2.1.3
+
+MINOR (2.1.x → 2.2.0): New features, backward compatible
+  Example: Add optional flow_logs_enabled variable (default: false)
+  Review before upgrading — new functionality
+
+MAJOR (2.x → 3.0.0): BREAKING CHANGES
+  Example: Rename variable subnet_count → public_subnet_count
+  Must update ALL callers before upgrading
+  Never auto-upgrade
 ```
 
-## Audience Levels
+---
 
-### 🟢 Beginner
-Use version tags. Without them, a teammate can break your production by updating a shared module. With `?ref=v1.2.0`, you control when you upgrade.
+## CHANGELOG.md — Required for Every Module Repo
 
-### 🔵 Intermediate
-Keep a `CHANGELOG.md` in every module repo. When you tag a new version, document: what changed, what broke, how to migrate.
+```markdown
+# Changelog
 
-### 🟠 Advanced
-Build a module registry CI pipeline: auto-run Terratest on every PR, enforce semver tags, auto-generate docs with `terraform-docs`.
+## v2.1.0 — 2024-03-15
+### Added
+- `enable_flow_logs` variable (default: false) — enables VPC flow logs to S3
 
-### 🔴 Expert
-Treat modules as versioned APIs. Deprecation policy: major versions supported for 12 months minimum. Provide migration guides for breaking changes. Build a compatibility matrix across Terraform versions.
+## v2.0.0 — 2024-02-01 — BREAKING CHANGE
+### Changed
+- Renamed `subnet_count` to `public_subnet_count`
+- Renamed `private_count` to `private_subnet_count`
+
+### Migration Guide
+```hcl
+# Before v2.0.0:
+module "vpc" {
+  subnet_count  = 3
+  private_count = 3
+}
+
+# After v2.0.0:
+module "vpc" {
+  public_subnet_count  = 3
+  private_subnet_count = 3
+}
+```
+
+## v1.3.0 — 2024-01-15
+### Added
+- IPv6 support via `enable_ipv6` variable
+```
+
+---
+
+## Module Repository Structure
+
+```
+terraform-modules/    ← dedicated repo, separate from application code
+  vpc/
+    variables.tf
+    main.tf
+    outputs.tf
+    README.md          ← generated by terraform-docs
+  eks/
+  rds/
+  alb/
+  CHANGELOG.md         ← document every version
+  README.md
+  .github/
+    workflows/
+      release.yml      ← CI: run tests + tag on merge to main
+```
+
+---
+
+## Auto-Generate Documentation with terraform-docs
+
+```bash
+brew install terraform-docs
+
+# Generate README.md from variables.tf and outputs.tf
+terraform-docs markdown ./modules/vpc > ./modules/vpc/README.md
+
+# Auto-update README on every commit (GitHub Actions):
+- uses: terraform-docs/gh-actions@v1
+  with:
+    working-dir: modules/vpc
+    output-file: README.md
+    git-push: true
+```

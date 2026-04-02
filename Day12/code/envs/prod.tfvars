@@ -1,0 +1,5 @@
+aws_region = "us-east-1"
+project = "day12"
+environment = "prod"
+vpc_cidr = "10.2.0.0/16"
+instance_type = "t3.large"
